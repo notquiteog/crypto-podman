@@ -213,6 +213,105 @@ build_daemon_image() {
     --file "$PREFIX/$chain.Containerfile" "$PREFIX"
 }
 
+onion_address() {
+  # The identity exists as soon as the service launches, but arti needs a moment
+  # after start before the command answers.
+  local nickname=$1 attempt address
+  for attempt in {1..60}; do
+    address=$(podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
+      --nickname "$nickname" onion-address 2>/dev/null | tr -d '\r\n')
+    if [[ -n $address ]]; then
+      printf '%s' "$address"
+      return 0
+    fi
+    sleep 2
+  done
+  printf 'unavailable — check: systemctl status arti'
+}
+
+print_operator_summary() {
+  local out="$PREFIX/secrets/connection-details.txt"
+  local btc_onion ltc_onion xmr_onion wallet_onion
+  btc_onion=$(onion_address bitcoin-rpc)
+  ltc_onion=$(onion_address litecoin-rpc)
+  xmr_onion=$(onion_address monero-rpc)
+  wallet_onion=$(onion_address monero-wallet-rpc)
+  load_credentials
+  # shellcheck disable=SC1091
+  . "$PREFIX/secrets/default-wallet-addresses.env" 2>/dev/null || true
+
+  umask 077
+  cat >"$out" <<SUMMARY
+================================================================
+ CONNECTION DETAILS — CONTAINS SECRETS, TREAT AS SENSITIVE
+================================================================
+Reprint at any time with:  sudo $0 --print-details
+
+Every endpoint below is reachable only through Tor.  The client must send
+traffic via a SOCKS5 proxy AND let the proxy resolve the name (socks5h://,
+or curl --socks5-hostname): .onion has no DNS.
+
+---- Bitcoin Core (node RPC + wallet) --------------------------
+  Onion            : ${btc_onion}:8332
+  Auth             : HTTP Basic
+  Username         : ${BITCOIN_RPC_USER}
+  Password         : ${BITCOIN_RPC_PASSWORD}
+  Wallet name      : default        (descriptor wallet, encrypted)
+  Wallet endpoint  : /wallet/default
+  Wallet passphrase: ${BITCOIN_WALLET_PASSPHRASE}
+  Receive address  : ${BITCOIN_DEFAULT_ADDRESS:-not yet generated}
+
+---- Litecoin Core (node RPC + wallet) -------------------------
+  Onion            : ${ltc_onion}:9332
+  Auth             : HTTP Basic
+  Username         : ${LITECOIN_RPC_USER}
+  Password         : ${LITECOIN_RPC_PASSWORD}
+  Wallet name      : default        (legacy wallet, encrypted)
+  Wallet endpoint  : /wallet/default
+  Wallet passphrase: ${LITECOIN_WALLET_PASSPHRASE}
+  Receive address  : ${LITECOIN_DEFAULT_ADDRESS:-not yet generated}
+
+---- Monero daemon (restricted node RPC) -----------------------
+  Onion            : ${xmr_onion}:18089
+  Auth             : HTTP Digest  (NOT Basic)
+  Username         : ${MONERO_RPC_USER}
+  Password         : ${MONERO_RPC_PASSWORD}
+  Endpoint         : /json_rpc
+
+---- Monero wallet RPC (spend-capable) -------------------------
+  Onion            : ${wallet_onion}:18088
+  Auth             : HTTP Digest  (NOT Basic)
+  Username         : ${MONERO_WALLET_RPC_USER}
+  Password         : ${MONERO_WALLET_RPC_PASSWORD}
+  Endpoint         : /json_rpc
+  Wallet file      : default
+  Wallet password  : ${MONERO_WALLET_PASSWORD}
+  Receive address  : ${MONERO_DEFAULT_ADDRESS:-not yet generated}
+
+---- Notes for whoever writes the client -----------------------
+* Monero uses HTTP **digest** auth.  Sending Basic auth with correct
+  credentials still returns 401, which looks like a wrong password.
+* Monero binds the digest nonce to the TCP connection, so the client must
+  keep the connection alive between the 401 challenge and the authenticated
+  retry.  A new socket per request fails every time.
+* Bitcoin and Litecoin wallets are encrypted and start LOCKED.  Receiving
+  and address generation work while locked; sending needs
+  walletpassphrase first, and the daemon caps that timeout at 100000000
+  seconds.  The unlock is in memory only: every daemon restart re-locks it.
+* Litecoin's wallet is legacy and cannot refill its address keypool while
+  locked.  After roughly 1000 addresses getnewaddress fails with "Keypool
+  ran out" until the wallet is unlocked once.
+* The Monero wallet RPC has no lock: while running it can always spend.
+* Treat every onion address as a secret.  There is no authorization at the
+  Tor layer, so the address plus these credentials is the entire gate.
+
+  Monero recovery seed (NOT needed to operate; back it up offline):
+    $PREFIX/secrets/monero-default-wallet-recovery.txt
+SUMMARY
+  chmod 0600 "$out"
+  cat "$out"
+}
+
 install_template() {
   local input=$1 output=$2
   sed \
@@ -245,8 +344,6 @@ main() {
   install -m 0644 "$BUNDLE_DIR/config/arti.toml" "$PREFIX/arti.toml"
   install -m 0644 "$BUNDLE_DIR/config/bitcoin.conf" "$PREFIX/bitcoin.conf"
   install -m 0644 "$BUNDLE_DIR/config/litecoin.conf" "$PREFIX/litecoin.conf"
-  autoload_wallet bitcoin "$PREFIX/bitcoin.conf"
-  autoload_wallet litecoin "$PREFIX/litecoin.conf"
   # monerod has no includeconf equivalent; build its config without printing its secret.
   install -m 0600 "$BUNDLE_DIR/config/monero.conf" "$PREFIX/monero.conf"
   sed -n '1,$p' "$PREFIX/secrets/monero-rpc.conf" >>"$PREFIX/monero.conf"
@@ -286,11 +383,21 @@ main() {
   systemctl start arti.service bitcoin.service litecoin.service monero.service
   ensure_core_wallet bitcoin bitcoin-cli BITCOIN_WALLET_PASSPHRASE BITCOIN_DEFAULT_ADDRESS true
   ensure_core_wallet litecoin litecoin-cli LITECOIN_WALLET_PASSPHRASE LITECOIN_DEFAULT_ADDRESS false
+  # Only now can these be written: the wallet has to exist before naming it in
+  # the config, and without the line the daemons come back from a reboot with no
+  # wallet loaded.
+  autoload_wallet bitcoin "$PREFIX/bitcoin.conf"
+  autoload_wallet litecoin "$PREFIX/litecoin.conf"
   ensure_monero_wallet
   systemctl start monero-wallet-rpc.service
   echo 'Installation complete.  Services may take time to bootstrap/sync.'
-  echo "Receive addresses: $PREFIX/secrets/default-wallet-addresses.env"
-  echo "Monero recovery output: $PREFIX/secrets/monero-default-wallet-recovery.txt"
+  print_operator_summary
 }
+
+if [[ ${1:-} == --print-details ]]; then
+  require_root
+  print_operator_summary
+  exit 0
+fi
 
 main "$@"

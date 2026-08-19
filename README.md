@@ -92,18 +92,36 @@ Flathub for the login that invoked `sudo`; choose **No** on a headless server.
 For noninteractive use, set `INSTALL_PODMAN_DESKTOP=yes` and (when needed)
 `PODMAN_DESKTOP_USER=<desktop-login>`.
 
-To display the four onion RPC endpoints after Arti has bootstrapped:
+When it finishes, the script prints everything needed to point an application
+at these nodes: each onion address and port, the RPC username and password, the
+authentication scheme, the wallet names, the wallet passphrases, and the default
+receive addresses. The same text is saved to
+`/etc/crypto-daemons/secrets/connection-details.txt` (mode 0600).
+
+To print it again later without reinstalling:
 
 ```bash
-sudo podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
-  --nickname bitcoin-rpc onion-address
-sudo podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
-  --nickname litecoin-rpc onion-address
-sudo podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
-  --nickname monero-rpc onion-address
-sudo podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
-  --nickname monero-wallet-rpc onion-address
+sudo ./setup.sh --print-details
 ```
+
+## Reboots
+
+The Quadlet units carry `WantedBy=multi-user.target`, and the generator wires
+them into the boot target, so all five services start again by themselves after
+a reboot. Arti keeps its onion addresses, because the service keys persist in
+`/srv/crypto-daemons/arti`.
+
+Two things do not survive a restart:
+
+* **The Bitcoin and Litecoin wallets come back locked.** `walletpassphrase`
+  keeps the key in memory only. Receiving and address generation still work,
+  but a send needs the wallet unlocked again.
+* **Any Monero wallet closed over RPC stays closed** unless
+  `monero-wallet-rpc` was started with `--wallet-dir`; the shipped unit uses
+  `--wallet-file`, which reopens the wallet automatically at start.
+
+The wallets themselves are loaded automatically: `setup.sh` writes a
+`wallet=default` line into each Core config once the wallet exists.
 
 Use a Tor SOCKS proxy on the client and standard HTTP Basic authentication.
 Bitcoin and Litecoin RPC are authenticated with the generated `rpcauth`
