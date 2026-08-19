@@ -104,6 +104,34 @@ To print it again later without reinstalling:
 sudo ./setup.sh --print-details
 ```
 
+## Wallet recovery material
+
+After creating the wallets, `setup.sh` also prints and saves the material needed
+to restore them, to `/etc/crypto-daemons/secrets/wallet-recovery.txt` (0600):
+
+```bash
+sudo ./setup.sh --print-recovery
+```
+
+**Only Monero has a mnemonic.** Bitcoin Core and Litecoin Core have never used
+BIP39 seed phrases, so there is no 25-word backup to print for them. What the
+script captures instead is the real equivalent:
+
+| Chain | Recovery material | Saved to |
+|---|---|---|
+| Monero | 25-word mnemonic | `monero-default-wallet-recovery.txt` |
+| Bitcoin | descriptors, each carrying the master private key | `bitcoin-wallet-descriptors.json` |
+| Litecoin | wallet dump with the HD master key | `litecoin-wallet-dump.txt` |
+
+Both Core exports require an unlocked wallet, so they are taken once at creation
+time and the wallet is re-locked immediately afterwards. The Litecoin dump is
+moved out of the chain data directory into the secrets directory, because
+`dumpwallet` writes every private key in cleartext wherever it is told to.
+
+This material is strictly more dangerous than the RPC credentials: it spends the
+coins with no password at all. Copy it offline and delete the server-side files
+once you have.
+
 ## Reboots
 
 The Quadlet units carry `WantedBy=multi-user.target`, and the generator wires

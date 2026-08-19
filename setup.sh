@@ -213,6 +213,92 @@ build_daemon_image() {
     --file "$PREFIX/$chain.Containerfile" "$PREFIX"
 }
 
+# ── Wallet recovery material ─────────────────────────────────────
+#
+# Only Monero has a mnemonic; Bitcoin Core and Litecoin Core have never used
+# seed phrases.  The equivalent secret is the descriptor set (Bitcoin) or the
+# HD master key inside a wallet dump (Litecoin).  Both exports require the
+# wallet to be unlocked, so this runs right after creation and re-locks.
+
+capture_bitcoin_descriptors() {
+  local out="$PREFIX/secrets/bitcoin-wallet-descriptors.json"
+  [[ -s $out ]] && return 0
+  podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default \
+    walletpassphrase "$BITCOIN_WALLET_PASSPHRASE" 60 >/dev/null
+  podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default \
+    listdescriptors true >"$out"
+  podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default walletlock >/dev/null
+  chmod 0600 "$out"
+}
+
+capture_litecoin_dump() {
+  local out="$PREFIX/secrets/litecoin-wallet-dump.txt"
+  [[ -s $out ]] && return 0
+  podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default \
+    walletpassphrase "$LITECOIN_WALLET_PASSPHRASE" 60 >/dev/null
+  podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default \
+    dumpwallet /data/wallet-dump.txt >/dev/null
+  podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default walletlock >/dev/null
+  # dumpwallet writes cleartext keys into the chain data volume; move it into
+  # the protected secrets directory rather than leaving it there.
+  mv "$DATA_DIR/litecoin/wallet-dump.txt" "$out"
+  chmod 0600 "$out"
+}
+
+# Last 25 all-lowercase words in the recovery output are the Monero seed.
+monero_mnemonic() {
+  local f="$PREFIX/secrets/monero-default-wallet-recovery.txt"
+  [[ -s $f ]] || { printf 'unavailable'; return 0; }
+  awk '/^[a-z]+( [a-z]+)*$/ { for (i = 1; i <= NF; i++) w[++n] = $i }
+       END { if (n >= 25) { for (i = n - 24; i <= n; i++) printf "%s%s", w[i], (i < n ? " " : "") }
+             else printf "unavailable" }' "$f"
+}
+
+print_recovery_summary() {
+  local out="$PREFIX/secrets/wallet-recovery.txt"
+  local desc_file="$PREFIX/secrets/bitcoin-wallet-descriptors.json"
+  local dump_file="$PREFIX/secrets/litecoin-wallet-dump.txt"
+  umask 077
+  {
+    cat <<'HEADER'
+================================================================
+ WALLET RECOVERY MATERIAL — SPEND KEYS.  BACK UP OFFLINE, THEN
+ REMOVE THIS FILE FROM THE SERVER.
+================================================================
+Anyone holding what follows can spend every coin in these wallets, with no
+password needed.  Reprint with:  setup.sh --print-recovery
+
+---- Monero — 25-word mnemonic ---------------------------------
+HEADER
+    printf '  %s\n\n' "$(monero_mnemonic)"
+
+    cat <<'BTCHDR'
+---- Bitcoin — descriptors (Bitcoin Core has no seed phrase) ----
+  Import these into a descriptor-capable wallet to restore.  Each carries the
+  master private key; the derivation paths and checksums matter, so keep them
+  verbatim.
+BTCHDR
+    if [[ -s $desc_file ]]; then
+      grep -oE '"desc": *"[^"]+"' "$desc_file" | sed -E 's/"desc": *"//; s/"$//' | sed 's/^/  /'
+    else
+      echo '  unavailable'
+    fi
+    printf '\n'
+
+    cat <<'LTCHDR'
+---- Litecoin — HD master key (no seed phrase either) ----------
+LTCHDR
+    if [[ -s $dump_file ]]; then
+      grep -E '^# extended private masterkey:' "$dump_file" | sed 's/^# /  /'
+      printf '  Full dump (every private key, needed for any non-HD keys):\n    %s\n' "$dump_file"
+    else
+      echo '  unavailable'
+    fi
+  } >"$out"
+  chmod 0600 "$out"
+  cat "$out"
+}
+
 onion_address() {
   # The identity exists as soon as the service launches, but arti needs a moment
   # after start before the command answers.
@@ -388,15 +474,24 @@ main() {
   # wallet loaded.
   autoload_wallet bitcoin "$PREFIX/bitcoin.conf"
   autoload_wallet litecoin "$PREFIX/litecoin.conf"
+  capture_bitcoin_descriptors
+  capture_litecoin_dump
   ensure_monero_wallet
   systemctl start monero-wallet-rpc.service
   echo 'Installation complete.  Services may take time to bootstrap/sync.'
   print_operator_summary
+  print_recovery_summary
 }
 
 if [[ ${1:-} == --print-details ]]; then
   require_root
   print_operator_summary
+  exit 0
+fi
+
+if [[ ${1:-} == --print-recovery ]]; then
+  require_root
+  print_recovery_summary
   exit 0
 fi
 
