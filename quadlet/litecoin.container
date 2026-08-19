@@ -7,12 +7,21 @@ Requires=arti.service
 Image=@@LITECOIN_IMAGE@@
 ContainerName=litecoin
 Network=crypto.network
+IP=10.89.0.12
 Volume=/srv/crypto-daemons/litecoin:/data
 Volume=/etc/crypto-daemons/litecoin.conf:/etc/litecoin/litecoin.conf:ro
 Volume=/etc/crypto-daemons/litecoin-rpcauth.conf:/etc/litecoin/rpcauth.conf:ro
-Exec=litecoind -conf=/etc/litecoin/litecoin.conf
+# The published images wrap the daemon in an entrypoint that chowns data and
+# re-execs through gosu/fixuid, which needs capabilities this unit drops; the
+# Bitcoin/Litecoin ones also append -datadir and would override datadir=/data.
+PodmanArgs=--entrypoint litecoind
+Exec=-conf=/etc/litecoin/litecoin.conf
 User=0
 NoNewPrivileges=true
+# Nothing legitimately writes to the image; all state lives in the mounted
+# volumes, so the container root filesystem is read-only.
+ReadOnly=true
+Tmpfs=/tmp
 DropCapability=all
 
 [Service]

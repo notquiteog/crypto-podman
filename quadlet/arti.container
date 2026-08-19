@@ -8,11 +8,17 @@ Requires=crypto-network.service
 Image=localhost/crypto-arti:2.5.1
 ContainerName=crypto-arti
 Network=crypto.network
+IP=10.89.0.10
 Volume=/etc/crypto-daemons/arti.toml:/etc/arti/arti.toml:ro
 Volume=/srv/crypto-daemons/arti:/var/lib/arti
 Exec=proxy --config /etc/arti/arti.toml
 User=0
 NoNewPrivileges=true
+# Nothing legitimately writes to the image; all state lives in the mounted
+# volumes, so the container root filesystem is read-only.
+ReadOnly=true
+Tmpfs=/tmp
+Environment=HOME=/var/lib/arti
 DropCapability=all
 
 [Service]

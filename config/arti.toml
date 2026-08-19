@@ -1,5 +1,8 @@
 [application]
 watch_configuration = false
+# The container runs as root with every capability dropped, matching the daemon
+# containers; Arti otherwise refuses to start.
+allow_running_as_root = true
 
 [proxy]
 # Bound only inside the private Podman bridge; never published to the host.
@@ -12,10 +15,14 @@ state_dir = "/var/lib/arti/state"
 # Each service has a separate, persistent onion identity.  Only the designated
 # RPC port is forwarded; all other virtual ports destroy the circuit.
 [onion_services."bitcoin-rpc"]
-proxy_ports = [["8332", "bitcoin:8332"], ["*", "destroy"]]
+proxy_ports = [["8332", "10.89.0.11:8332"], ["*", "destroy"]]
 
 [onion_services."litecoin-rpc"]
-proxy_ports = [["9332", "litecoin:9332"], ["*", "destroy"]]
+proxy_ports = [["9332", "10.89.0.12:9332"], ["*", "destroy"]]
 
 [onion_services."monero-rpc"]
-proxy_ports = [["18089", "monero:18089"], ["*", "destroy"]]
+proxy_ports = [["18089", "10.89.0.13:18089"], ["*", "destroy"]]
+
+# Spend-capable wallet RPC has a distinct onion identity from the node RPC.
+[onion_services."monero-wallet-rpc"]
+proxy_ports = [["18088", "10.89.0.14:18088"], ["*", "destroy"]]

@@ -1,21 +1,21 @@
 [Unit]
-Description=Bitcoin Core (Tor-only, RPC via Arti onion service)
-After=arti.service
-Requires=arti.service
+Description=Monero default wallet RPC (authenticated onion service)
+After=monero.service
+Requires=monero.service
 
 [Container]
-Image=@@BITCOIN_IMAGE@@
-ContainerName=bitcoin
+Image=@@MONERO_IMAGE@@
+ContainerName=monero-wallet-rpc
 Network=crypto.network
-IP=10.89.0.11
-Volume=/srv/crypto-daemons/bitcoin:/data
-Volume=/etc/crypto-daemons/bitcoin.conf:/etc/bitcoin/bitcoin.conf:ro
-Volume=/etc/crypto-daemons/bitcoin-rpcauth.conf:/etc/bitcoin/rpcauth.conf:ro
+IP=10.89.0.14
+Volume=/srv/crypto-daemons/monero-wallet:/wallets
+Volume=/etc/crypto-daemons/monero-wallet-rpc.conf:/etc/monero-wallet/monero-wallet-rpc.conf:ro
+Volume=/etc/crypto-daemons/secrets/monero-wallet-password:/etc/monero-wallet/wallet-password:ro
 # The published images wrap the daemon in an entrypoint that chowns data and
 # re-execs through gosu/fixuid, which needs capabilities this unit drops; the
 # Bitcoin/Litecoin ones also append -datadir and would override datadir=/data.
-PodmanArgs=--entrypoint bitcoind
-Exec=-conf=/etc/bitcoin/bitcoin.conf
+PodmanArgs=--entrypoint monero-wallet-rpc
+Exec=--config-file=/etc/monero-wallet/monero-wallet-rpc.conf
 User=0
 NoNewPrivileges=true
 # Nothing legitimately writes to the image; all state lives in the mounted
@@ -27,7 +27,7 @@ DropCapability=all
 [Service]
 Restart=always
 RestartSec=20
-TimeoutStopSec=10min
+TimeoutStopSec=5min
 
 [Install]
 WantedBy=multi-user.target

@@ -7,11 +7,20 @@ Requires=arti.service
 Image=@@MONERO_IMAGE@@
 ContainerName=monero
 Network=crypto.network
+IP=10.89.0.13
 Volume=/srv/crypto-daemons/monero:/data
 Volume=/etc/crypto-daemons/monero.conf:/etc/monero/monerod.conf:ro
-Exec=monerod --config-file=/etc/monero/monerod.conf
+# The published images wrap the daemon in an entrypoint that chowns data and
+# re-execs through gosu/fixuid, which needs capabilities this unit drops; the
+# Bitcoin/Litecoin ones also append -datadir and would override datadir=/data.
+PodmanArgs=--entrypoint monerod
+Exec=--non-interactive --config-file=/etc/monero/monerod.conf
 User=0
 NoNewPrivileges=true
+# Nothing legitimately writes to the image; all state lives in the mounted
+# volumes, so the container root filesystem is read-only.
+ReadOnly=true
+Tmpfs=/tmp
 DropCapability=all
 
 [Service]
