@@ -5,6 +5,12 @@ restricted RPC interfaces only as separate v3 onion services.  No TCP port is
 published on the Debian host.  Podman Quadlet keeps the four containers under
 systemd.
 
+All three chains are configured to retain the least historical block data their
+supported safe pruning modes permit: Bitcoin Core and Litecoin Core use the
+550 MiB automatic block/undo target, and Monero uses pruned-block sync. They
+still fully validate the chain, but cannot provide old blocks, historical
+transaction lookups, rescans, or full initial-sync service to other peers.
+
 ## Before installing
 
 1. Use a fresh, supported Debian 13 host with enough fast, redundant storage.
@@ -71,6 +77,10 @@ credentials; Monero's only exposed interface is its restricted RPC port.
 * Back up `/srv/crypto-daemons/arti/state` as it holds the onion-service keys.
   Back up daemon data only if the re-sync cost matters; do not back up it as a
   substitute for wallet-key backups.
+* For an already-synced Monero data directory, `prune-blockchain=1` marks data
+  prunable but does not immediately make its LMDB file smaller. Stop Monero and
+  use the version-matched `monero-blockchain-prune` tool with a verified backup
+  before expecting reclaimed host disk space.
 * Review firewall rules separately.  This bundle publishes no ports, but it
   does not overwrite an existing host firewall.
 * To update an image, stop the affected service cleanly, rerun the script with
