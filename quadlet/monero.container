@@ -1,0 +1,23 @@
+[Unit]
+Description=Monero daemon (Tor-only, restricted RPC via Arti onion service)
+After=arti.service
+Requires=arti.service
+
+[Container]
+Image=@@MONERO_IMAGE@@
+ContainerName=monero
+Network=crypto.network
+Volume=/srv/crypto-daemons/monero:/data
+Volume=/etc/crypto-daemons/monero.conf:/etc/monero/monerod.conf:ro
+Exec=monerod --config-file=/etc/monero/monerod.conf
+User=0
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=always
+RestartSec=20
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

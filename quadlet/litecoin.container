@@ -1,0 +1,24 @@
+[Unit]
+Description=Litecoin Core (Tor-only, RPC via Arti onion service)
+After=arti.service
+Requires=arti.service
+
+[Container]
+Image=@@LITECOIN_IMAGE@@
+ContainerName=litecoin
+Network=crypto.network
+Volume=/srv/crypto-daemons/litecoin:/data
+Volume=/etc/crypto-daemons/litecoin.conf:/etc/litecoin/litecoin.conf:ro
+Volume=/etc/crypto-daemons/litecoin-rpcauth.conf:/etc/litecoin/rpcauth.conf:ro
+Exec=litecoind -conf=/etc/litecoin/litecoin.conf
+User=0
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=always
+RestartSec=20
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

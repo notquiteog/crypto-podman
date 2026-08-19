@@ -1,0 +1,21 @@
+[application]
+watch_configuration = false
+
+[proxy]
+# Bound only inside the private Podman bridge; never published to the host.
+socks_listen = "0.0.0.0:9150"
+
+[storage]
+cache_dir = "/var/lib/arti/cache"
+state_dir = "/var/lib/arti/state"
+
+# Each service has a separate, persistent onion identity.  Only the designated
+# RPC port is forwarded; all other virtual ports destroy the circuit.
+[onion_services."bitcoin-rpc"]
+proxy_ports = [["8332", "bitcoin:8332"], ["*", "destroy"]]
+
+[onion_services."litecoin-rpc"]
+proxy_ports = [["9332", "litecoin:9332"], ["*", "destroy"]]
+
+[onion_services."monero-rpc"]
+proxy_ports = [["18089", "monero:18089"], ["*", "destroy"]]

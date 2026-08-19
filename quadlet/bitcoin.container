@@ -1,0 +1,24 @@
+[Unit]
+Description=Bitcoin Core (Tor-only, RPC via Arti onion service)
+After=arti.service
+Requires=arti.service
+
+[Container]
+Image=@@BITCOIN_IMAGE@@
+ContainerName=bitcoin
+Network=crypto.network
+Volume=/srv/crypto-daemons/bitcoin:/data
+Volume=/etc/crypto-daemons/bitcoin.conf:/etc/bitcoin/bitcoin.conf:ro
+Volume=/etc/crypto-daemons/bitcoin-rpcauth.conf:/etc/bitcoin/rpcauth.conf:ro
+Exec=bitcoind -conf=/etc/bitcoin/bitcoin.conf
+User=0
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=always
+RestartSec=20
+TimeoutStopSec=10min
+
+[Install]
+WantedBy=multi-user.target

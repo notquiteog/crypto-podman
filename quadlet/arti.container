@@ -1,0 +1,24 @@
+[Unit]
+Description=Arti SOCKS proxy and onion RPC reverse proxies
+After=network-online.target crypto-network.service
+Wants=network-online.target
+Requires=crypto-network.service
+
+[Container]
+Image=localhost/crypto-arti:2.5.1
+ContainerName=crypto-arti
+Network=crypto.network
+Volume=/etc/crypto-daemons/arti.toml:/etc/arti/arti.toml:ro
+Volume=/srv/crypto-daemons/arti:/var/lib/arti
+Exec=proxy --config /etc/arti/arti.toml
+User=0
+NoNewPrivileges=true
+DropCapability=all
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target
