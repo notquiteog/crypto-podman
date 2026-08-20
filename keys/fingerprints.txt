@@ -1,0 +1,42 @@
+# Release-signing keys this bundle trusts, and how many must agree.
+#
+# These fingerprints are the trust anchor for update.sh.  Key material itself is
+# fetched over the network, but nothing is imported unless its primary-key
+# fingerprint appears below, so the transport does not have to be trusted --
+# only this file, which is reviewable in git.
+#
+# Fingerprints are PRIMARY keys.  Several Bitcoin builders sign with subkeys;
+# pinning a subkey would break the moment it is rotated.
+#
+# Format:
+#   threshold <chain> <n>          minimum distinct good signatures required
+#   key <chain> <fingerprint> <url-to-key>
+#
+# To review: every fingerprint below signed the currently pinned release, and
+# was checked with `gpg --verify` against the upstream manifest on 2026-08-20.
+
+# Bitcoin Core publishes one manifest signed by many Guix builders.  Requiring
+# four independent signatures is what the README's provenance claim rests on.
+threshold bitcoin 4
+key bitcoin 0AD83877C1F0CD1EE9BD660AD7CC770B81FD22A8 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/benthecarman.gpg
+key bitcoin 152812300785C96444D3334D17565732E08E5E41 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/achow101.gpg
+key bitcoin 5B286407E1EA6FE01CF9AF48BF131C2D0536F8AC https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/marcofleon.gpg
+key bitcoin 67AA5B46E7AF78053167FE343B8F814A784218F8 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/willcl-ark.gpg
+key bitcoin 9EDAFF80E080659604F4A76B2EBB056FD847F8A7 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/Emzy.gpg
+key bitcoin A8FC55F3B04BA3146F3492E79303B33A305224CB https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/sedited.gpg
+key bitcoin D1DBF2C4B96F2DEBF4C16654410108112E7EA81F https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/hebasto.gpg
+key bitcoin E61773CD6E01040E2F1BD78CE7E2984B6289C93A https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/pinheadmz.gpg
+key bitcoin E777299FC265DD04793070EB944D35F9AC3DB76A https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/fanquake.gpg
+key bitcoin ED9BDF7AD6A55E232E84524257FF9BDBCC301009 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/Sjors.gpg
+key bitcoin F4FC70F07310028424EFC20A8E4256593F177720 https://raw.githubusercontent.com/bitcoin-core/guix.sigs/main/builder-keys/guggero.gpg
+
+# Monero ships a single clearsigned hashes.txt from the release signer.
+threshold monero 1
+key monero 81AC591FE9C4B65C5806AFC3F0AF4D462A0BDF92 https://raw.githubusercontent.com/monero-project/monero/master/utils/gpg_keys/binaryfate.asc
+
+# Litecoin's manifest carries exactly one signature and that key is EXPIRED.
+# The signature is cryptographically valid and the key ships in Litecoin's own
+# repository, but this is weaker provenance than the other two.  update.sh
+# reports the expiry on every check rather than hiding it.
+threshold litecoin 1
+key litecoin D35621D53A1CC6A3456758D03620E9D387E55666 https://raw.githubusercontent.com/litecoin-project/litecoin/master/contrib/gitian-keys/davidburkett38-key.pgp
