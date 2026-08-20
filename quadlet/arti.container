@@ -5,7 +5,7 @@ Wants=network-online.target
 Requires=crypto-network.service
 
 [Container]
-Image=localhost/crypto-arti:2.5.1
+Image=@@ARTI_IMAGE@@
 ContainerName=crypto-arti
 Network=crypto.network
 IP=10.89.0.10

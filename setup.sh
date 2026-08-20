@@ -6,16 +6,77 @@ umask 077
 readonly PREFIX=/etc/crypto-daemons
 readonly QUADLET_DIR=/etc/containers/systemd
 readonly DATA_DIR=/srv/crypto-daemons
-readonly ARTI_IMAGE=localhost/crypto-arti:2.5.1
+readonly BUNDLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+containerfile_arg() {
+  # Read an ARG default straight out of the Containerfile that consumes it.
+  # Each version is then declared exactly once, next to the checksum it is
+  # verified against, so an image tag cannot claim a version the image does
+  # not actually contain.
+  local file=$1 name=$2 value
+  value=$(sed -n "s/^ARG ${name}=//p" "$file")
+  value=${value%%$'\n'*}
+  if [[ -z $value ]]; then
+    printf 'Could not read ARG %s from %s\n' "$name" "$file" >&2
+    exit 3
+  fi
+  printf '%s\n' "$value"
+}
+
 # Every daemon image is built locally from the upstream project's own signed
-# release tarball; the pinned checksums live in containers/*.Containerfile.
-readonly BITCOIN_VERSION=31.1
-readonly LITECOIN_VERSION=0.21.5.6
-readonly MONERO_VERSION=0.18.5.1
+# release tarball.  The version and the checksum it is checked against both
+# live in containers/*.Containerfile; bump them there and nowhere else.
+ARTI_VERSION="$(containerfile_arg "$BUNDLE_DIR/containers/arti.Containerfile" ARTI_VERSION)"
+BITCOIN_VERSION="$(containerfile_arg "$BUNDLE_DIR/containers/bitcoin.Containerfile" BITCOIN_VERSION)"
+LITECOIN_VERSION="$(containerfile_arg "$BUNDLE_DIR/containers/litecoin.Containerfile" LITECOIN_VERSION)"
+MONERO_VERSION="$(containerfile_arg "$BUNDLE_DIR/containers/monero.Containerfile" MONERO_VERSION)"
+readonly ARTI_VERSION BITCOIN_VERSION LITECOIN_VERSION MONERO_VERSION
+readonly ARTI_IMAGE="localhost/crypto-arti:${ARTI_VERSION}"
 readonly BITCOIN_IMAGE="localhost/crypto-bitcoin:${BITCOIN_VERSION}"
 readonly LITECOIN_IMAGE="localhost/crypto-litecoin:${LITECOIN_VERSION}"
 readonly MONERO_IMAGE="localhost/crypto-monero:${MONERO_VERSION}"
-readonly BUNDLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# The two registry images this bundle still needs, pinned so a clean checkout
+# installs with no arguments.  These are the docker.io/library/debian:trixie-slim
+# and docker.io/library/rust:1-trixie multi-arch indexes as resolved on
+# 2026-08-20; pinning the index digest keeps the per-architecture resolution.
+# Both are Debian 13, matching the host this script targets and each other's
+# glibc, which matters because arti is compiled in the Rust image and run in
+# the Debian one.  Override either with the environment variable of the same
+# name -- require_digest still refuses mutable tags.  README.md records how to
+# re-verify these and how to refresh them.
+readonly DEFAULT_BASE_IMAGE='docker.io/library/debian@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258'
+readonly DEFAULT_ARTI_RUST_IMAGE='docker.io/library/rust@sha256:b1b3c9c0d921d7fa0a6d1f9ec7e4eab87f8c8ec97644c3d791450f131dec813f'
+
+usage() {
+  cat <<USAGE
+Usage: sudo ./setup.sh [OPTION]
+
+Installs the Tor-routed Bitcoin, Litecoin and Monero Quadlets on Debian 13.
+Run with no options for a default install; it is idempotent and safe to re-run.
+
+Options:
+  --print-details    Reprint operator connection details and exit.
+  --print-recovery   Reprint wallet recovery material and exit.
+  -h, --help         Show this message and exit.
+
+Environment:
+  BASE_IMAGE               Debian build/runtime base, as an immutable
+                           name@sha256:... reference.  Mutable tags are
+                           refused.  Default:
+                             $DEFAULT_BASE_IMAGE
+  ARTI_RUST_IMAGE          Rust image used to compile arti, same digest rule.
+                           Default:
+                             $DEFAULT_ARTI_RUST_IMAGE
+  INSTALL_PODMAN_DESKTOP   yes/no; skips the interactive prompt.
+  PODMAN_DESKTOP_USER      Desktop login to install Podman Desktop for,
+                           required when that is enabled and you are root.
+
+The daemons themselves are always built here from upstream signed releases
+with checksums pinned in containers/*.Containerfile; no daemon image is
+pulled from a registry.  See README.md.
+USAGE
+}
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
@@ -126,14 +187,18 @@ initialize_secrets() {
 }
 
 wait_for_core_rpc() {
+  # main restarts the daemons, so this waits for a real block-index reload
+  # rather than answering instantly against an already-running node.  Ten
+  # minutes matches the units' TimeoutStopSec and costs nothing when the
+  # daemon comes up quickly.
   local container=$1 cli=$2 attempt
-  for attempt in {1..120}; do
+  for attempt in {1..300}; do
     if podman exec "$container" "$cli" -datadir=/data getblockchaininfo >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
-  echo "$container RPC did not become ready within four minutes." >&2
+  echo "$container RPC did not become ready within ten minutes." >&2
   return 1
 }
 
@@ -401,6 +466,7 @@ SUMMARY
 install_template() {
   local input=$1 output=$2
   sed \
+    -e "s|@@ARTI_IMAGE@@|${ARTI_IMAGE}|g" \
     -e "s|@@BITCOIN_IMAGE@@|${BITCOIN_IMAGE}|g" \
     -e "s|@@LITECOIN_IMAGE@@|${LITECOIN_IMAGE}|g" \
     -e "s|@@MONERO_IMAGE@@|${MONERO_IMAGE}|g" \
@@ -411,8 +477,11 @@ main() {
   require_root
   # Only the two build base images come from a registry now, and both must still
   # be immutable: they are the root of trust for every binary built below.
-  require_digest BASE_IMAGE "${BASE_IMAGE:-}"
-  require_digest ARTI_RUST_IMAGE "${ARTI_RUST_IMAGE:-}"
+  # Unset means "use the reviewed pin above", not "pick something mutable".
+  BASE_IMAGE=${BASE_IMAGE:-$DEFAULT_BASE_IMAGE}
+  ARTI_RUST_IMAGE=${ARTI_RUST_IMAGE:-$DEFAULT_ARTI_RUST_IMAGE}
+  require_digest BASE_IMAGE "$BASE_IMAGE"
+  require_digest ARTI_RUST_IMAGE "$ARTI_RUST_IMAGE"
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -457,7 +526,7 @@ main() {
   build_daemon_image monero "$MONERO_IMAGE"
 
   install -m 0644 "$BUNDLE_DIR/quadlet/crypto.network" "$QUADLET_DIR/crypto.network"
-  install -m 0644 "$BUNDLE_DIR/quadlet/arti.container" "$QUADLET_DIR/arti.container"
+  install_template "$BUNDLE_DIR/quadlet/arti.container" "$QUADLET_DIR/arti.container"
   install_template "$BUNDLE_DIR/quadlet/bitcoin.container" "$QUADLET_DIR/bitcoin.container"
   install_template "$BUNDLE_DIR/quadlet/litecoin.container" "$QUADLET_DIR/litecoin.container"
   install_template "$BUNDLE_DIR/quadlet/monero.container" "$QUADLET_DIR/monero.container"
@@ -466,7 +535,10 @@ main() {
   systemctl daemon-reload
   # Quadlet-generated units cannot be enabled; the generator applies each unit's
   # [Install] section itself, so starting them is all that is required.
-  systemctl start arti.service bitcoin.service litecoin.service monero.service
+  # restart rather than start: on a re-run the units are already up, and start
+  # would leave them on the previous image after a version or base-image bump.
+  # The chain units allow 10min TimeoutStopSec, so this is a clean shutdown.
+  systemctl restart arti.service bitcoin.service litecoin.service monero.service
   ensure_core_wallet bitcoin bitcoin-cli BITCOIN_WALLET_PASSPHRASE BITCOIN_DEFAULT_ADDRESS true
   ensure_core_wallet litecoin litecoin-cli LITECOIN_WALLET_PASSPHRASE LITECOIN_DEFAULT_ADDRESS false
   # Only now can these be written: the wallet has to exist before naming it in
@@ -477,22 +549,33 @@ main() {
   capture_bitcoin_descriptors
   capture_litecoin_dump
   ensure_monero_wallet
-  systemctl start monero-wallet-rpc.service
+  systemctl restart monero-wallet-rpc.service
   echo 'Installation complete.  Services may take time to bootstrap/sync.'
   print_operator_summary
   print_recovery_summary
 }
 
-if [[ ${1:-} == --print-details ]]; then
-  require_root
-  print_operator_summary
-  exit 0
-fi
-
-if [[ ${1:-} == --print-recovery ]]; then
-  require_root
-  print_recovery_summary
-  exit 0
-fi
-
-main "$@"
+case ${1:-} in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  --print-details)
+    require_root
+    print_operator_summary
+    exit 0
+    ;;
+  --print-recovery)
+    require_root
+    print_recovery_summary
+    exit 0
+    ;;
+  '')
+    main
+    ;;
+  *)
+    printf 'Unknown option: %s\n\n' "$1" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

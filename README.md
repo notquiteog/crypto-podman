@@ -22,12 +22,12 @@ transaction lookups, rescans, or full initial-sync service to other peers.
 1. Use a fresh, supported Debian 13 host with enough fast, redundant storage.
    A non-pruned Bitcoin node alone currently needs hundreds of GB; plan disk
    capacity and backups before syncing.
-2. Choose and pin the three daemon images by immutable digest.  The bundle
-   intentionally refuses mutable tags: these daemons validate money, so image
-   provenance is a security boundary.  The `setup.sh` usage message shows the
-   exact environment variables.
-   Each image must provide the standard `bitcoind`, `litecoind`, or `monerod`
-   executable and accept the configuration path passed by its Quadlet.
+2. Review the two pinned build base images, or replace them with your own.
+   `setup.sh` ships a reviewed, digest-pinned default for each, so a clean
+   checkout installs with no arguments.  Overriding is still allowed, but the
+   bundle refuses mutable tags in either case: these daemons validate money, so
+   image provenance is a security boundary.  Run `./setup.sh --help` for the
+   exact variables, and see "Verifying or refreshing the build bases" below.
 3. This is a **hot-wallet** deployment: the server generates and holds spend
    keys for default BTC, LTC, and XMR wallets. Fund it only with an amount you
    can accept losing if the server is compromised. Use an external signer or a
@@ -35,13 +35,43 @@ transaction lookups, rescans, or full initial-sync service to other peers.
 
 ## Install
 
-Copy this directory to the server, pin your reviewed images, then run:
+Copy this directory to the server and run:
 
 ```bash
-sudo BASE_IMAGE='docker.io/library/debian@sha256:362e64223cc0da95422b3b13c045186fc0a81250e765d31c025fbddf257f6143' \
-     ARTI_RUST_IMAGE='docker.io/library/rust@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97' \
-     ./setup.sh
+sudo ./setup.sh
 ```
+
+That is the whole install.  It is idempotent, so re-running it after a change
+or a failed attempt is safe.  It asks one optional question (whether to install
+Podman Desktop, default no); set `INSTALL_PODMAN_DESKTOP=no` to skip even that
+and run completely unattended.
+
+Expect it to take a while: it compiles arti from source and downloads three
+daemon release tarballs before the nodes ever start syncing.
+
+To build against your own reviewed bases instead of the shipped pins:
+
+```bash
+sudo BASE_IMAGE='docker.io/library/debian@sha256:...' ARTI_RUST_IMAGE='docker.io/library/rust@sha256:...' ./setup.sh
+```
+
+### Verifying or refreshing the build bases
+
+The defaults in `setup.sh` are the `docker.io/library/debian:trixie-slim` and
+`docker.io/library/rust:1-trixie` indexes as resolved on 2026-08-20.  Both are
+Debian 13, which matches the host this bundle targets and keeps the glibc of
+the image that compiles arti in step with the image that runs it.
+
+To confirm a pin still names the tag it claims, or to get the current digest
+when you want to move the pin forward, ask the registry:
+
+```bash
+repo=library/debian; tag=trixie-slim; tok=$(curl -fsSL "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'); curl -fsSI -H "Authorization: Bearer $tok" -H 'Accept: application/vnd.oci.image.index.v1+json' -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p'
+```
+
+Moving a pin forward is a deliberate act: read what changed in the base first,
+then edit `DEFAULT_BASE_IMAGE` / `DEFAULT_ARTI_RUST_IMAGE` in `setup.sh` and
+update the date in the comment above them.
 
 ## Where the binaries come from
 
@@ -49,7 +79,7 @@ No third-party daemon image is used. `setup.sh` builds every image locally:
 Bitcoin Core, Litecoin Core and Monero come from each project's own official
 release tarball, and Arti is compiled from the pinned `arti` crate. The only
 images pulled from a registry are the two build bases above, which is why they
-must still be given as immutable digests.
+are digest-pinned rather than tagged.
 
 Each `containers/*.Containerfile` pins the SHA256 of the release tarball it
 downloads and fails the build if the download does not match. Those checksums
@@ -82,10 +112,12 @@ binaries; the Monero image must provide `monero-wallet-cli` and
 `monero-wallet-rpc` as well as `monerod`.
 
 The script is idempotent: rerunning it preserves data, RPC credentials, and
-Arti onion-service keys. It builds `localhost/crypto-arti:2.5.1` from the
-pinned `arti` crate with onion-service support, installs Quadlets into
-`/etc/containers/systemd`, creates encrypted default wallets once, then starts
-`arti`, `bitcoin`, `litecoin`, `monero`, and `monero-wallet-rpc`.
+Arti onion-service keys. It builds `localhost/crypto-arti` from the pinned
+`arti` crate with onion-service support, tagged with the version in
+`containers/arti.Containerfile`, installs Quadlets into
+`/etc/containers/systemd`, creates encrypted default wallets once, then
+restarts `arti`, `bitcoin`, `litecoin`, `monero`, and `monero-wallet-rpc` so a
+rerun adopts any image it just rebuilt.
 
 During an interactive run it asks whether to install Podman Desktop through
 Flathub for the login that invoked `sudo`; choose **No** on a headless server.
@@ -103,6 +135,49 @@ To print it again later without reinstalling:
 ```bash
 sudo ./setup.sh --print-details
 ```
+
+## Applying security updates
+
+Nothing here auto-updates. Every component is pinned, which is what makes the
+build reproducible and the provenance checkable, but it also means patching is
+a deliberate act. Each version is declared in exactly one place:
+
+| Component | Bump it here | Then |
+|---|---|---|
+| Bitcoin / Litecoin / Monero | `ARG *_VERSION` **and** `ARG *_SHA256` in that chain's `containers/*.Containerfile` | rerun `setup.sh` |
+| Arti | `ARG ARTI_VERSION` in `containers/arti.Containerfile` | rerun `setup.sh` |
+| Container userland (glibc, openssl, ca-certificates, libstdc++) | `DEFAULT_BASE_IMAGE` in `setup.sh` | rerun `setup.sh` |
+| Rust toolchain that builds arti | `DEFAULT_ARTI_RUST_IMAGE` in `setup.sh` | rerun `setup.sh` |
+| Host packages (podman, slirp4netns, …) | `apt` on the host | not covered by `setup.sh` |
+
+`setup.sh` derives every image tag from the `ARG` in the Containerfile and
+substitutes it into the Quadlet, so one edit propagates to what is built and to
+what systemd starts. Take the new checksum from the project's signed manifest
+and verify the signature before pasting it in; the build fails closed if the
+download does not match, so a wrong checksum is a failed build rather than a
+compromised node.
+
+Then rebuild and adopt the result:
+
+```bash
+sudo ./setup.sh
+```
+
+The script restarts the units at the end, so the rebuilt images are actually
+picked up. The chain daemons allow a 10-minute stop timeout, so they shut down
+cleanly rather than being killed into a reindex.
+
+One caveat specific to the container userland: while the base digest is
+unchanged, the `apt-get` layers stay cached and a rebuild pulls in no package
+updates. Patches for glibc, openssl and friends arrive only when
+`DEFAULT_BASE_IMAGE` moves, which invalidates every layer beneath it. Refresh
+that digest on the same cadence you would apply Debian security updates to a
+normal host.
+
+The host itself is not managed here at all. `setup.sh` installs podman and its
+dependencies but configures no `unattended-upgrades` and no timer. A rootful
+podman vulnerability is a container-escape path on a machine holding spend
+keys, so keep the host patched by whatever means you already trust.
 
 ## Wallet recovery material
 
