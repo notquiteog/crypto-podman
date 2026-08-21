@@ -550,6 +550,16 @@ and keep a way in — an unconverted service, or console access — while you do
   bounds how long systemd waits for that command. Without it both Core daemons
   are killed mid-flush on every restart and reboot and replay blocks on the way
   back up. If you add a daemon here, give it the same treatment.
+* **Arti is always SIGKILLed on stop.** It does not exit on SIGTERM in this
+  configuration, so podman falls back to a kill after its 10-second grace and
+  the container reports 137. Raising the stop timeout to 30 or 60 seconds, and
+  adding `--init` so Arti is not PID 1, were both measured and changed nothing,
+  so the default is left alone rather than making every shutdown slower for the
+  same outcome. `SuccessExitStatus=137` in the unit keeps that expected kill out
+  of `systemctl --failed`; the tradeoff is that a genuine OOM kill of Arti also
+  reads as success, which `Restart=always` and the restart counter still expose.
+  Arti's state under `/srv/crypto-daemons/arti` therefore has to tolerate an
+  abrupt stop — one more reason the README asks you to back it up.
 * `setup.sh` and `update.sh` remove this bundle's own superseded
   `localhost/crypto-*` image tags after a successful restart. Nothing else is
   touched, and an image still in use is left alone. Dangling layers from the

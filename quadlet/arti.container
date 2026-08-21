@@ -45,6 +45,16 @@ HealthRetries=3
 Restart=always
 RestartSec=10
 TimeoutStartSec=5min
+# Arti does not exit on SIGTERM here, so podman always falls back to SIGKILL
+# and the container reports 137.  Measured: raising --stop-timeout to 30s or
+# 60s, and adding --init so arti is not PID 1, both make no difference -- they
+# only delay the same kill, so the default 10s is deliberately left alone.
+# Without this line the unit lands in `failed` after every stop, including at
+# shutdown, which would train an operator to ignore `systemctl --failed` -- the
+# signal the README asks them to watch.  The cost is that a genuine OOM kill of
+# arti also reads as success; Restart=always and NRestarts still expose that,
+# and arti peaks around 45 MB on a host sized for three chains.
+SuccessExitStatus=137
 
 [Install]
 WantedBy=multi-user.target
