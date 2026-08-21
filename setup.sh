@@ -68,7 +68,7 @@ maybe_install_podman_desktop() {
         echo 'Set PODMAN_DESKTOP_USER to the desktop login when installing as root.' >&2
         return 1
       fi
-      desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6)
+          desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6) || desktop_home=''
       if [[ -z $desktop_home ]]; then
         echo "Podman Desktop user does not exist: $desktop_user" >&2
         return 1
@@ -148,6 +148,17 @@ enable_time_sync() {
     echo 'synchronised by whatever means you already use.' >&2
     return 0
   fi
+  # Without a bound this unit waits forever, and every container orders itself
+  # After=time-sync.target -- so an unreachable NTP server would hold the whole
+  # deployment at boot rather than starting it with a slightly wrong clock.
+  # Ordering is not a requirement, so a timeout still lets the target be reached.
+  install -d -m 0755 /etc/systemd/system/systemd-time-wait-sync.service.d
+  cat >/etc/systemd/system/systemd-time-wait-sync.service.d/timeout.conf <<'TIMEOUT'
+[Service]
+TimeoutStartSec=5min
+TIMEOUT
+  chmod 0644 /etc/systemd/system/systemd-time-wait-sync.service.d/timeout.conf
+  systemctl daemon-reload
   systemctl enable --now systemd-time-wait-sync.service ||
     echo 'Could not enable systemd-time-wait-sync; clock ordering is advisory only.' >&2
 }
@@ -240,7 +251,7 @@ ensure_monero_wallet() {
     printf '%s\n' "$MONERO_WALLET_PASSWORD" | podman run --rm -i --network none --user 0 \
       --entrypoint monero-wallet-cli \
       -v "$DATA_DIR/monero-wallet:/wallets" \
-      -v "$PREFIX/secrets:/secrets:ro" \
+      -v "$PREFIX/secrets/monero-wallet-password:/secrets/monero-wallet-password:ro" \
       "$MONERO_IMAGE" --generate-new-wallet /wallets/default \
       --password-file /secrets/monero-wallet-password \
       --mnemonic-language English --offline --create-address-file seed >"$recovery_file"
@@ -607,7 +618,9 @@ main() {
   apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
     ca-certificates openssl xxd gnupg curl jq
   warn_podman_version
-  maybe_install_podman_desktop
+  # Optional and cosmetic; a failure here must not take the install with it.
+  maybe_install_podman_desktop ||
+    echo 'Podman Desktop step failed; continuing without it.' >&2
   enable_time_sync
 
   install -d -m 0755 "$PREFIX" "$QUADLET_DIR" "$DATA_DIR" "$DATA_DIR/arti"

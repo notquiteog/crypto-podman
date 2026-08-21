@@ -11,7 +11,6 @@ umask 077
 # shellcheck source=lib.sh
 . "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
-readonly UA='crypto-daemons-podman'
 readonly COMPONENTS=(bitcoin litecoin monero arti base rust)
 WORK=''
 trap '[[ -n $WORK ]] && rm -rf -- "$WORK"' EXIT
@@ -46,7 +45,10 @@ Never prints wallet recovery material or RPC credentials; use
 USAGE
 }
 
-fetch() { curl -fsSL --max-time 60 -A "$UA" "$@" </dev/null; }
+# No custom User-Agent: this runs on the host over the clearnet once a day, and
+# a bundle-specific string would tag that traffic as this deployment.  curl's
+# default is generic and satisfies GitHub's requirement that one be sent.
+fetch() { curl -fsSL --max-time 60 "$@" </dev/null; }
 # --yes because --batch otherwise refuses to overwrite an existing --output
 # file, which reads as a zero-signature verification on the second chain.
 gpgr()  { gpg --batch --yes --no-tty --homedir "$KEYRING_DIR" "$@"; }
@@ -203,7 +205,7 @@ latest_digest() {
   local repo=$1 tag=$2 token
   token=$(fetch "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" |
           jq -r .token)
-  curl -fsSI --max-time 60 -A "$UA" -H "Authorization: Bearer $token" \
+  curl -fsSI --max-time 60 -H "Authorization: Bearer $token" \
     -H 'Accept: application/vnd.oci.image.index.v1+json' \
     -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
     "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" </dev/null |
@@ -292,20 +294,45 @@ repin_chain() {
   validate "the checksum of $chain" "$sha" "$SHA256_RE" || return 1
   sed -i -e "s|^ARG ${upper}_VERSION=.*|ARG ${upper}_VERSION=${version}|" \
          -e "s|^ARG ${upper}_SHA256=.*|ARG ${upper}_SHA256=${sha}|" "$file"
+  # sed reports success when its pattern matched nothing, so confirm the pins
+  # actually changed rather than trusting the exit status.  A Containerfile that
+  # has been reshaped by hand would otherwise be rebuilt at its old version.
+  if ! grep -qxF "ARG ${upper}_VERSION=${version}" "$file" ||
+     ! grep -qxF "ARG ${upper}_SHA256=${sha}" "$file"; then
+    printf 'Failed to re-pin %s in %s; its ARG lines are not where expected.\n' \
+      "$chain" "$file" >&2
+    return 1
+  fi
   printf '  re-pinned %s to %s\n' "$chain" "$version"
 }
 
+# Returns 2, distinctly from an error, when the digest has not moved.
 repin_digest() {
-  local var=$1 repo=$2 tag=$3 digest
+  local var=$1 repo=$2 tag=$3 comp=$4 digest line
   digest=$(latest_digest "$repo" "$tag")
   [[ -n $digest ]] || { printf 'Could not resolve %s:%s\n' "$repo" "$tag" >&2; return 1; }
   validate "the digest of $repo:$tag" "$digest" "$DIGEST_RE" || return 1
-  sed -i "s|^readonly ${var}=.*|readonly ${var}='docker.io/${repo}@${digest}'|" "$BUNDLE_DIR/lib.sh"
+  # Safe to read the in-memory pin: lib.sh was sourced before anything rewrote it.
+  if [[ $digest == "$(pinned_version "$comp")" ]]; then
+    printf '  %s already current\n' "$comp"
+    return 2
+  fi
+  line="readonly ${var}='docker.io/${repo}@${digest}'"
+  sed -i "s|^readonly ${var}=.*|${line}|" "$BUNDLE_DIR/lib.sh"
+  grep -qxF "$line" "$BUNDLE_DIR/lib.sh" || {
+    printf 'Failed to re-pin %s in lib.sh; its declaration is not where expected.\n' \
+      "$var" >&2
+    return 1
+  }
   printf '  re-pinned %s to %s\n' "$var" "$digest"
 }
 
 cmd_apply() {
-  local comp latest sha
+  local comp latest sha file rc
+  # Only what actually moved is redeployed.  Naming a component that turns out
+  # to be current used to rebuild and restart it anyway, which is a needless
+  # outage on a daemon that handles money.
+  local -a changed=()
   import_keys
   for comp in "$@"; do
     case $comp in
@@ -314,20 +341,42 @@ cmd_apply() {
         [[ $latest == "$(pinned_version "$comp")" ]] && { printf '  %s already current\n' "$comp"; continue; }
         sha=$(verify_manifest "$comp" "$latest") || return 1
         repin_chain "$comp" "$latest" "$sha"
+        changed+=("$comp")
         ;;
       arti)
         latest=$(latest_version arti)
         validate 'the version of arti' "$latest" "$VERSION_RE" || return 1
         [[ $latest == "$ARTI_VERSION" ]] && { printf '  arti already current\n'; continue; }
-        sed -i "s|^ARG ARTI_VERSION=.*|ARG ARTI_VERSION=${latest}|" \
-          "$BUNDLE_DIR/containers/arti.Containerfile"
+        file="$BUNDLE_DIR/containers/arti.Containerfile"
+        sed -i "s|^ARG ARTI_VERSION=.*|ARG ARTI_VERSION=${latest}|" "$file"
+        grep -qxF "ARG ARTI_VERSION=${latest}" "$file" || {
+          printf 'Failed to re-pin arti in %s; its ARG line is not where expected.\n' \
+            "$file" >&2
+          return 1
+        }
         printf '  re-pinned arti to %s\n' "$latest"
+        changed+=(arti)
         ;;
-      base) repin_digest DEFAULT_BASE_IMAGE library/debian trixie-slim ;;
-      rust) repin_digest DEFAULT_ARTI_RUST_IMAGE library/rust 1-trixie ;;
+      base|rust)
+        rc=0
+        case $comp in
+          base) repin_digest DEFAULT_BASE_IMAGE library/debian trixie-slim base || rc=$? ;;
+          rust) repin_digest DEFAULT_ARTI_RUST_IMAGE library/rust 1-trixie rust || rc=$? ;;
+        esac
+        # 2 means the digest had not moved; anything else non-zero is an error.
+        if (( rc == 0 )); then
+          changed+=("$comp")
+        elif (( rc != 2 )); then
+          return "$rc"
+        fi
+        ;;
       *) printf 'Unknown component: %s\n' "$comp" >&2; return 64 ;;
     esac
   done
+  if (( ${#changed[@]} == 0 )); then
+    printf '\nEvery component named was already current; nothing rebuilt.\n'
+    return 0
+  fi
   # Re-exec so lib.sh re-reads the pins just rewritten; otherwise the rebuild
   # would tag images with the versions this process started with.
   printf '\nRebuilding from the new pins...\n'
@@ -335,7 +384,7 @@ cmd_apply() {
   # copy makes a $WORK of its own.
   rm -rf -- "$WORK"
   WORK=''
-  exec "$BUNDLE_DIR/update.sh" --redeploy "$@"
+  exec "$BUNDLE_DIR/update.sh" --redeploy "${changed[@]}"
 }
 
 cmd_redeploy() {

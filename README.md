@@ -239,6 +239,9 @@ answer RPC again before reporting success. Components are `bitcoin`,
 `litecoin`, `monero`, `arti`, `base` and `rust`; name more than one to do
 several at once. There is deliberately no "apply everything" flag — see below.
 
+Only components that actually moved are rebuilt and restarted; naming one that
+turns out to be current reports it and leaves it running.
+
 `sudo ./update.sh --redeploy` rebuilds and restarts from the pins exactly as
 they stand, without consulting upstream. Use it after editing a Containerfile
 by hand.
@@ -405,6 +408,9 @@ Enforced:
   Tor-only posture survives a bad config rather than depending on one. Only
   Arti (which needs Tor) and Litecoin (which cannot use it) are on
   `crypto-egress.network`.
+* Bitcoin and Litecoin accept RPC only from Arti's address on their bridge,
+  not from the whole subnet. Core always permits loopback in addition, which is
+  what each container's own health check uses.
 * All four RPC endpoints require credentials. Bitcoin and Litecoin use salted
   `rpcauth` hashes (the plaintext password is never stored in a file the daemon
   reads); Monero's daemon and wallet RPC use HTTP digest auth. Unauthenticated
@@ -427,6 +433,12 @@ Not enforced, and worth understanding before funding anything:
   and privilege escalation is blocked, but a container-escape vulnerability
   would land as root. Running each daemon under a dedicated unprivileged uid
   would be a further improvement.
+* **The spend-capable wallet RPC cannot be IP-restricted.** Bitcoin's and
+  Litecoin's RPC now admit only Arti's bridge address, but `monero-wallet-rpc`
+  has no equivalent option, so anything on the internal network — bitcoind
+  included — can reach its port and attempt authentication. Splitting it onto a
+  network of its own would fix that, at the cost of a third bridge; it is
+  credentials and Tor that protect it today.
 * **The Monero wallet RPC is spend-capable for its whole lifetime.** It has no
   per-request confirmation. Anyone who obtains its onion address *and* its
   credentials can transfer the balance. Bitcoin and Litecoin are better off
@@ -443,7 +455,9 @@ Not enforced, and worth understanding before funding anything:
   about the host's own ports, not about unreachability.
 * **The daily update check runs on the host, not in a container**, so it
   reaches bitcoincore.org, getmonero.org, GitHub, crates.io and Docker Hub over
-  the clearnet from this host's own IP, on a schedule. Disable the timer and
+  the clearnet from this host's own IP, on a schedule. It sends curl's default
+  User-Agent rather than one naming this bundle, but the pattern of endpoints is
+  itself distinctive. Disable the timer and
   run `--check` from elsewhere if that pattern matters to you.
 * **Litecoin's provenance is weaker** than the other two (single signature,
   expired key), and its P2P traffic is not routed over Tor. Its DNS seed
@@ -570,6 +584,10 @@ and keep a way in — an unconverted service, or console access — while you do
 * The daemon units order themselves `After=time-sync.target`, and `setup.sh`
   enables `systemd-time-wait-sync` so that target is actually reached — on its
   own the ordering is a no-op, because nothing pulls that target in by default.
+  `setup.sh` also drops in a `TimeoutStartSec=5min` for that unit: it waits
+  indefinitely by default, and since every container orders itself behind the
+  target, an unreachable NTP server would otherwise hold the entire deployment
+  at boot rather than starting it with a slightly wrong clock.
   If the host uses chrony or ntpsec instead of `systemd-timesyncd`, `setup.sh`
   says so and leaves clock synchronisation to you. Both Core daemons and Monero
   handle a badly skewed clock poorly.
