@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily check for new crypto-daemon releases
+
+[Timer]
+OnCalendar=daily
+# Spread the upstream API calls out; nothing here is time-critical.
+RandomizedDelaySec=4h
+# Catch up after downtime rather than silently skipping a day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

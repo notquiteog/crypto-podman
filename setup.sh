@@ -24,6 +24,13 @@ material every time; use ./update.sh for routine updates.
 Options:
   --print-details    Reprint operator connection details and exit.
   --print-recovery   Reprint wallet recovery material and exit.
+  --shred-recovery   Destroy the server-side copies of the spend keys, once
+                     they are backed up offline.  Irreversible.
+  --add-rpc-client <service> <name>
+                     Authorize one client for restricted discovery on an onion
+                     service, and print its private key.  Services are
+                     bitcoin-rpc, litecoin-rpc, monero-rpc, monero-wallet-rpc.
+                     See the restricted-discovery notes in config/arti.toml.
   -h, --help         Show this message and exit.
 
 Environment:
@@ -77,6 +84,21 @@ maybe_install_podman_desktop() {
       return 2
       ;;
   esac
+}
+
+enable_time_sync() {
+  # The daemon units order themselves After=time-sync.target, but that target is
+  # only ever reached if something pulls it in: systemd ships
+  # systemd-time-wait-sync for exactly this and leaves it disabled.  Without it
+  # the ordering is a no-op and the nodes can start against an unsynchronised
+  # clock, which Monero and both Core daemons all handle badly.
+  if ! systemctl cat systemd-time-wait-sync.service >/dev/null 2>&1; then
+    echo 'systemd-time-wait-sync is not available; make sure the host clock is' >&2
+    echo 'synchronised by whatever means you already use.' >&2
+    return 0
+  fi
+  systemctl enable --now systemd-time-wait-sync.service ||
+    echo 'Could not enable systemd-time-wait-sync; clock ordering is advisory only.' >&2
 }
 
 random_password() { openssl rand -hex 32; }
@@ -272,6 +294,114 @@ LTCHDR
   cat "$out"
 }
 
+recovery_files() {
+  printf '%s\n' \
+    "$PREFIX/secrets/wallet-recovery.txt" \
+    "$PREFIX/secrets/bitcoin-wallet-descriptors.json" \
+    "$PREFIX/secrets/litecoin-wallet-dump.txt" \
+    "$PREFIX/secrets/monero-default-wallet-recovery.txt"
+}
+
+shred_recovery() {
+  # The README has always told the operator to delete these by hand once they
+  # are backed up.  Until that happens the wallet encryption is decorative: the
+  # cleartext master keys sit in the same directory as the wallets they
+  # protect, so anyone who can read the disk can spend without a passphrase.
+  local -a present=()
+  local f
+  while IFS= read -r f; do [[ -e $f ]] && present+=("$f"); done < <(recovery_files)
+  if (( ${#present[@]} == 0 )); then
+    echo 'No server-side recovery material found; nothing to shred.'
+    return 0
+  fi
+  cat <<WARN
+About to destroy the server-side copies of the spend keys:
+
+$(printf '  %s\n' "${present[@]}")
+This cannot be undone.  Do not continue unless the material is already backed
+up offline and you have verified that backup.
+
+Two things to know first:
+
+  * The Monero mnemonic exists nowhere else on this host.  Once it is gone it
+    can only be recovered from the wallet itself, using the wallet password in
+    rpc-credentials.env with monero-wallet-cli.
+  * The Bitcoin and Litecoin exports are derived from their wallets, so a later
+    full run of setup.sh will simply recreate them.  Shred again after any such
+    run, or the files come back.
+
+Neither the RPC credentials nor the wallet passphrases are touched; the daemons
+need those to run.  Note also that shred cannot promise much on a copy-on-write
+or journalling filesystem, or on flash with wear levelling -- treat this as
+closing the obvious hole, not as forensic erasure.
+
+WARN
+  local answer
+  read -r -p 'Type SHRED to continue: ' answer
+  if [[ $answer != SHRED ]]; then
+    echo 'Aborted; nothing was removed.'
+    return 1
+  fi
+  for f in "${present[@]}"; do
+    shred -u -z -- "$f" && printf '  shredded %s\n' "$f"
+  done
+  echo 'Done.  setup.sh --print-recovery will now report the material as unavailable.'
+}
+
+add_rpc_client() {
+  # Generates one x25519 keypair for Arti's restricted discovery: the public
+  # half is authorized here, the private half is printed once for the client.
+  # This only takes effect once the service's restricted_discovery block is
+  # uncommented in arti.toml -- see the notes there, and rebuild Arti first.
+  local service=${1:-} name=${2:-} dir tmp pub priv
+  case $service in
+    bitcoin-rpc|litecoin-rpc|monero-rpc|monero-wallet-rpc) ;;
+    *)
+      echo 'Service must be one of: bitcoin-rpc litecoin-rpc monero-rpc monero-wallet-rpc' >&2
+      return 64
+      ;;
+  esac
+  # The name becomes a filename in a directory Arti reads; keep it boring.
+  if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
+    echo 'Client name must be alphanumeric, with - and _ allowed after the first character.' >&2
+    return 64
+  fi
+  dir="$DATA_DIR/arti/authorized_clients/$service"
+  install -d -m 0700 "$dir"
+  if [[ -e $dir/$name.auth ]]; then
+    echo "A client called $name is already authorized for $service." >&2
+    echo "Remove $dir/$name.auth first if you mean to reissue its key." >&2
+    return 1
+  fi
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf -- '$tmp'" RETURN
+  openssl genpkey -algorithm x25519 -out "$tmp/key.pem"
+  # Both DER encodings put the raw 32-byte key last, which is what Tor's
+  # base32 client-auth format wants.
+  pub=$(openssl pkey -in "$tmp/key.pem" -pubout -outform DER | tail -c 32 | base32 | tr -d '=\n')
+  priv=$(openssl pkey -in "$tmp/key.pem" -outform DER | tail -c 32 | base32 | tr -d '=\n')
+  printf 'descriptor:x25519:%s\n' "$pub" >"$dir/$name.auth"
+  chmod 0600 "$dir/$name.auth"
+  cat <<CLIENT
+
+Authorized '$name' for $service.
+  Public key recorded in: $dir/$name.auth
+
+Give the client this private key.  It is printed once and is not stored here:
+
+  descriptor:x25519:$priv
+
+For a C-tor client, that line goes in ClientOnionAuthDir as
+<onion-address-without-.onion>:descriptor:x25519:$priv
+
+Restricted discovery is not active until you uncomment this service's
+restricted_discovery block in /etc/crypto-daemons/arti.toml and restart Arti.
+Confirm you can still reach the service afterwards, from a client holding this
+key, before doing the same to the others.
+CLIENT
+}
+
 onion_address() {
   # The identity exists as soon as the service launches, but arti needs a moment
   # after start before the command answers.
@@ -392,22 +522,33 @@ main() {
 
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  # gnupg is for update.sh, which verifies upstream release signatures.
+  # gnupg and jq are for update.sh: it verifies upstream release signatures and
+  # parses the GitHub, crates.io and registry APIs.  Without jq every component
+  # check fails, so it is a hard dependency of the bundle, not an extra.
   apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
-    ca-certificates openssl xxd gnupg curl
+    ca-certificates openssl xxd gnupg curl jq
   maybe_install_podman_desktop
+  enable_time_sync
 
-  install -d -m 0755 "$PREFIX" "$QUADLET_DIR" "$DATA_DIR" \
-    "$DATA_DIR/arti" "$DATA_DIR/bitcoin" "$DATA_DIR/litecoin" "$DATA_DIR/monero"
+  install -d -m 0755 "$PREFIX" "$QUADLET_DIR" "$DATA_DIR" "$DATA_DIR/arti"
+  # 0700, not 0755: capture_litecoin_dump has litecoind write a cleartext copy
+  # of every private key into its data directory before moving it into secrets,
+  # and the daemon writes under the container's umask, not this script's.  A
+  # world-readable data directory would expose it for that window.
+  install -d -m 0700 "$DATA_DIR/bitcoin" "$DATA_DIR/litecoin" "$DATA_DIR/monero"
   # -walletdir must already exist or the daemon refuses to start.
   install -d -m 0700 "$DATA_DIR/bitcoin/wallets" "$DATA_DIR/litecoin/wallets"
   install -d -m 0700 "$DATA_DIR/monero-wallet"
+  # Empty unless --add-rpc-client is used; Arti only reads these when a
+  # service's restricted_discovery block is uncommented in arti.toml.
+  install -d -m 0700 "$DATA_DIR/arti/authorized_clients"
   initialize_secrets
   install_configs
   write_images_env
 
   build_all_images
   install_quadlets
+  migrate_internal_network
   restart_chain_services
 
   ensure_core_wallet bitcoin bitcoin-cli BITCOIN_WALLET_PASSPHRASE BITCOIN_DEFAULT_ADDRESS true
@@ -421,6 +562,10 @@ main() {
   capture_litecoin_dump
   ensure_monero_wallet
   systemctl restart monero-wallet-rpc.service
+  # Last, not with the other installs: Persistent=true and no stamp file means
+  # the timer fires its first check the moment it is enabled, and that is worth
+  # far less noise once the install has actually finished.
+  install_update_timer
   echo 'Installation complete.  Services may take time to bootstrap/sync.'
   print_operator_summary
   print_recovery_summary
@@ -440,6 +585,17 @@ case ${1:-} in
     require_root
     print_recovery_summary
     exit 0
+    ;;
+  --shred-recovery)
+    require_root
+    shred_recovery
+    exit $?
+    ;;
+  --add-rpc-client)
+    require_root
+    shift
+    add_rpc_client "${1:-}" "${2:-}"
+    exit $?
     ;;
   '')
     main

@@ -1,14 +1,20 @@
 [Unit]
 Description=Arti SOCKS proxy and onion RPC reverse proxies
-After=network-online.target crypto-network.service
+# time-sync.target matters for the daemons Arti fronts: Tor and both Core
+# nodes reject peers whose clocks disagree.  setup.sh enables
+# systemd-time-wait-sync so this ordering has something to wait for.
+After=network-online.target time-sync.target
 Wants=network-online.target
-Requires=crypto-network.service
 
 [Container]
 Image=@@ARTI_IMAGE@@
 ContainerName=crypto-arti
-Network=crypto.network
-IP=10.89.0.10
+# Dual-homed on purpose.  The internal network carries the daemons that must
+# never touch the clearnet; the egress network is the only route out of this
+# bundle, and Arti is the only thing on it that speaks Tor.  Quadlet derives the
+# Requires=/After= on both network units from these lines.
+Network=crypto.network:ip=10.89.0.10
+Network=crypto-egress.network:ip=10.89.1.10
 Volume=/etc/crypto-daemons/arti.toml:/etc/arti/arti.toml:ro
 Volume=/srv/crypto-daemons/arti:/var/lib/arti
 Exec=proxy --config /etc/arti/arti.toml
@@ -20,6 +26,16 @@ ReadOnly=true
 Tmpfs=/tmp
 Environment=HOME=/var/lib/arti
 DropCapability=all
+# Liveness only, and deliberately report-only: a failing check shows up in
+# `podman ps` and `systemctl status` but does not restart anything.  Flip
+# HealthOnFailure=kill once you have watched a check be accurate on your host;
+# a subtly wrong check that restarts a daemon is worse than no check at all.
+# bash, not sh: /dev/tcp is a bash builtin and Debian's sh is dash.
+HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/9150"
+HealthInterval=1m
+HealthStartPeriod=5m
+HealthTimeout=20s
+HealthRetries=3
 
 [Service]
 Restart=always

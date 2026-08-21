@@ -1,4 +1,15 @@
 [Network]
+# Internal: no gateway route out, so the daemons on this network physically
+# cannot reach the clearnet.  Bitcoin's and Monero's Tor-only posture is then a
+# property of the network rather than a promise made by their config files.
 NetworkName=crypto
 Subnet=10.89.0.0/24
 Gateway=10.89.0.1
+Internal=true
+# Internal alone still leaves DNS working: podman's aardvark-dns listens on the
+# bridge and forwards queries to the host's resolvers, so a daemon that looked
+# up a seed hostname would leak the query even though the connection that
+# followed would fail.  Nothing on this network resolves names -- every peer is
+# addressed by static IP, and Bitcoin and Monero resolve through Arti's SOCKS
+# proxy -- so disabling DNS costs nothing and closes that path.
+DisableDNS=true

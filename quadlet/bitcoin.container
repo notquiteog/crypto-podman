@@ -1,13 +1,12 @@
 [Unit]
 Description=Bitcoin Core (Tor-only, RPC via Arti onion service)
-After=arti.service
+After=arti.service time-sync.target
 Requires=arti.service
 
 [Container]
 Image=@@BITCOIN_IMAGE@@
 ContainerName=bitcoin
-Network=crypto.network
-IP=10.89.0.11
+Network=crypto.network:ip=10.89.0.11
 Volume=/srv/crypto-daemons/bitcoin:/data
 Volume=/etc/crypto-daemons/bitcoin.conf:/etc/bitcoin/bitcoin.conf:ro
 Volume=/etc/crypto-daemons/bitcoin-rpcauth.conf:/etc/bitcoin/rpcauth.conf:ro
@@ -23,6 +22,15 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp
 DropCapability=all
+# Report-only liveness; see the note in arti.container before enabling
+# HealthOnFailure=kill.  bitcoin-cli authenticates with the .cookie the daemon
+# writes into /data, so this needs no credentials of its own.  The long start
+# period covers the block-index load, during which RPC is not yet answering.
+HealthCmd=bitcoin-cli -datadir=/data getblockchaininfo
+HealthInterval=1m
+HealthStartPeriod=15m
+HealthTimeout=30s
+HealthRetries=3
 
 [Service]
 Restart=always

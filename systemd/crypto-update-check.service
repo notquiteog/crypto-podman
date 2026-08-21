@@ -1,0 +1,15 @@
+[Unit]
+Description=Check for new crypto-daemon releases, and verify their signatures
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# --check is read-only: it re-pins nothing, restarts nothing, and cannot print
+# wallet recovery material or RPC credentials, because those functions live in
+# setup.sh.  That is what makes it safe here, where stdout lands in the journal.
+ExecStart=@@BUNDLE_DIR@@/update.sh --check
+# A non-zero exit is meaningful rather than noise: it means a component could
+# not be reached, or that a new release failed its signature threshold and was
+# reported BLOCKED.  Both are things worth seeing in `systemctl --failed`.
+Nice=10

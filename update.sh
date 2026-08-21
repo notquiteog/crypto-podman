@@ -300,15 +300,40 @@ cmd_redeploy() {
   install_quadlets
 
   if (( rebuild_all )); then
+    # Everything is about to be restarted anyway, which is the only safe moment
+    # to rebuild the network underneath it.
+    migrate_internal_network
     restart_all_services
   else
-    for comp in "${comps[@]}"; do systemctl restart "${comp}.service"; done
+    for comp in "${comps[@]}"; do
+      systemctl restart "${comp}.service"
+      # monero-wallet-rpc runs the same image as monerod, and install_quadlets
+      # has already repointed its unit at the new tag.  Without this it keeps
+      # running the old container until something else restarts it, leaving a
+      # spend-capable wallet on a different Monero build from the daemon it
+      # talks to -- and doing so silently.
+      if [[ $comp == monero ]]; then
+        systemctl restart monero-wallet-rpc.service
+      fi
+    done
   fi
 
   # Confirm the chain daemons actually answered after the restart, so a failed
-  # update is reported here rather than discovered later.
-  wait_for_core_rpc bitcoin bitcoin-cli
-  wait_for_core_rpc litecoin litecoin-cli
+  # update is reported here rather than discovered later.  Only the ones this
+  # run actually touched: waiting on a daemon nobody restarted would turn an
+  # unrelated outage into a ten-minute hang.
+  for comp in "${comps[@]}"; do
+    case $comp in
+      bitcoin)  wait_for_core_rpc bitcoin bitcoin-cli ;;
+      litecoin) wait_for_core_rpc litecoin litecoin-cli ;;
+      arti|base|rust)
+        # These rebuild everything, so both Core daemons were restarted.
+        wait_for_core_rpc bitcoin bitcoin-cli
+        wait_for_core_rpc litecoin litecoin-cli
+        break
+        ;;
+    esac
+  done
   printf 'Update complete.  Deployed images:\n'
   sed 's/^/  /' "$PREFIX/images.env"
 }

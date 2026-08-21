@@ -1,13 +1,14 @@
 [Unit]
 Description=Monero default wallet RPC (authenticated onion service)
-After=monero.service
+After=monero.service time-sync.target
 Requires=monero.service
 
 [Container]
 Image=@@MONERO_IMAGE@@
 ContainerName=monero-wallet-rpc
-Network=crypto.network
-IP=10.89.0.14
+# Internal network only, and never the egress one: this process holds a
+# spend-capable wallet and has no business reaching anything but monerod.
+Network=crypto.network:ip=10.89.0.14
 Volume=/srv/crypto-daemons/monero-wallet:/wallets
 Volume=/etc/crypto-daemons/monero-wallet-rpc.conf:/etc/monero-wallet/monero-wallet-rpc.conf:ro
 Volume=/etc/crypto-daemons/secrets/monero-wallet-password:/etc/monero-wallet/wallet-password:ro
@@ -23,6 +24,12 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp
 DropCapability=all
+# Report-only liveness; see the notes in arti.container and monero.container.
+HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/18088"
+HealthInterval=1m
+HealthStartPeriod=5m
+HealthTimeout=30s
+HealthRetries=3
 
 [Service]
 Restart=always

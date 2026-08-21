@@ -1,0 +1,8 @@
+[Network]
+# The only network in this bundle with a route to the internet.  Membership is
+# deliberately limited to Arti, which needs it to reach the Tor network, and
+# Litecoin, which cannot bootstrap over Tor at all (see README).  Adding a
+# daemon here silently removes its Tor-only guarantee.
+NetworkName=crypto-egress
+Subnet=10.89.1.0/24
+Gateway=10.89.1.1

@@ -1,13 +1,12 @@
 [Unit]
 Description=Monero daemon (Tor-only, restricted RPC via Arti onion service)
-After=arti.service
+After=arti.service time-sync.target
 Requires=arti.service
 
 [Container]
 Image=@@MONERO_IMAGE@@
 ContainerName=monero
-Network=crypto.network
-IP=10.89.0.13
+Network=crypto.network:ip=10.89.0.13
 Volume=/srv/crypto-daemons/monero:/data
 Volume=/etc/crypto-daemons/monero.conf:/etc/monero/monerod.conf:ro
 # The published images wrap the daemon in an entrypoint that chowns data and
@@ -22,6 +21,15 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp
 DropCapability=all
+# Report-only liveness; see the note in arti.container.  A TCP connect rather
+# than an RPC call: monerod's RPC requires the digest credentials appended to
+# its config, and a health check that can fail on authentication would report
+# a healthy node as sick.  This proves the listener is accepting connections.
+HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/18089"
+HealthInterval=1m
+HealthStartPeriod=15m
+HealthTimeout=30s
+HealthRetries=3
 
 [Service]
 Restart=always

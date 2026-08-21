@@ -14,15 +14,58 @@ state_dir = "/var/lib/arti/state"
 
 # Each service has a separate, persistent onion identity.  Only the designated
 # RPC port is forwarded; all other virtual ports destroy the circuit.
+#
+# Bitcoin, Monero and the Monero wallet RPC live on the internal network, which
+# has no route to the internet; Litecoin is on the egress network because it
+# cannot bootstrap over Tor.  Arti is on both, which is why it can reach all
+# four.  See quadlet/crypto.network and quadlet/crypto-egress.network.
 [onion_services."bitcoin-rpc"]
 proxy_ports = [["8332", "10.89.0.11:8332"], ["*", "destroy"]]
+# restricted_discovery.enabled = true
 
 [onion_services."litecoin-rpc"]
-proxy_ports = [["9332", "10.89.0.12:9332"], ["*", "destroy"]]
+proxy_ports = [["9332", "10.89.1.12:9332"], ["*", "destroy"]]
+# restricted_discovery.enabled = true
 
 [onion_services."monero-rpc"]
 proxy_ports = [["18089", "10.89.0.13:18089"], ["*", "destroy"]]
+# restricted_discovery.enabled = true
 
 # Spend-capable wallet RPC has a distinct onion identity from the node RPC.
 [onion_services."monero-wallet-rpc"]
 proxy_ports = [["18088", "10.89.0.14:18088"], ["*", "destroy"]]
+# restricted_discovery.enabled = true
+
+# ---- Restricted discovery (client authorization) ----------------------------
+# Off by default.  Enabling it means an onion address is no longer enough to
+# reach a service: the client also needs an x25519 key, which turns "the
+# address is the secret" into a real second gate in front of a hot wallet.
+#
+# Two steps, in this order:
+#
+#   1. Rebuild Arti.  containers/arti.Containerfile compiles it with the
+#      restricted-discovery cargo feature, but an image built before that
+#      change does not have it, and Arti refuses to start on a configuration it
+#      cannot honour -- which would take every service down at once:
+#        sudo ./update.sh --redeploy arti
+#
+#   2. Authorize at least one client per service you are gating, then uncomment
+#      both that service's restricted_discovery.enabled line above and its
+#      key_dirs block below:
+#        sudo ./setup.sh --add-rpc-client bitcoin-rpc laptop
+#
+# Enabling a service with an empty key directory publishes a descriptor nobody
+# can decrypt, locking you out of that service until you add a key.  Do one
+# service first and confirm you can still reach it before doing the rest.
+#
+# [[onion_services."bitcoin-rpc".restricted_discovery.key_dirs]]
+# path = "/var/lib/arti/authorized_clients/bitcoin-rpc"
+#
+# [[onion_services."litecoin-rpc".restricted_discovery.key_dirs]]
+# path = "/var/lib/arti/authorized_clients/litecoin-rpc"
+#
+# [[onion_services."monero-rpc".restricted_discovery.key_dirs]]
+# path = "/var/lib/arti/authorized_clients/monero-rpc"
+#
+# [[onion_services."monero-wallet-rpc".restricted_discovery.key_dirs]]
+# path = "/var/lib/arti/authorized_clients/monero-wallet-rpc"

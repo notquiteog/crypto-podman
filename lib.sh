@@ -84,6 +84,7 @@ load_credentials() {
 install_template() {
   local input=$1 output=$2
   sed \
+    -e "s|@@BUNDLE_DIR@@|${BUNDLE_DIR}|g" \
     -e "s|@@ARTI_IMAGE@@|${ARTI_IMAGE}|g" \
     -e "s|@@BITCOIN_IMAGE@@|${BITCOIN_IMAGE}|g" \
     -e "s|@@LITECOIN_IMAGE@@|${LITECOIN_IMAGE}|g" \
@@ -143,6 +144,8 @@ build_all_images() {
 
 install_quadlets() {
   install -m 0644 "$BUNDLE_DIR/quadlet/crypto.network" "$QUADLET_DIR/crypto.network"
+  install -m 0644 "$BUNDLE_DIR/quadlet/crypto-egress.network" \
+    "$QUADLET_DIR/crypto-egress.network"
   install_template "$BUNDLE_DIR/quadlet/arti.container" "$QUADLET_DIR/arti.container"
   install_template "$BUNDLE_DIR/quadlet/bitcoin.container" "$QUADLET_DIR/bitcoin.container"
   install_template "$BUNDLE_DIR/quadlet/litecoin.container" "$QUADLET_DIR/litecoin.container"
@@ -150,6 +153,57 @@ install_quadlets() {
   install_template "$BUNDLE_DIR/quadlet/monero-wallet-rpc.container" \
     "$QUADLET_DIR/monero-wallet-rpc.container"
   systemctl daemon-reload
+}
+
+install_update_timer() {
+  # update.sh is run from wherever the bundle was copied, so the unit records
+  # that path at install time.  Moving the bundle afterwards breaks the timer;
+  # rerun setup.sh from the new location to repoint it.
+  install_template "$BUNDLE_DIR/systemd/crypto-update-check.service" \
+    /etc/systemd/system/crypto-update-check.service
+  # install_template redirects under this script's umask 077; systemd is happy
+  # either way, but keep it consistent with every other unit file here.
+  chmod 0644 /etc/systemd/system/crypto-update-check.service
+  install -m 0644 "$BUNDLE_DIR/systemd/crypto-update-check.timer" \
+    /etc/systemd/system/crypto-update-check.timer
+  systemctl daemon-reload
+  systemctl enable --now crypto-update-check.timer
+}
+
+migrate_internal_network() {
+  # `podman network create --ignore` leaves an existing network exactly as it
+  # was, so a host installed before crypto.network became internal keeps a
+  # network with egress and DNS -- and nothing anywhere would say so.  The
+  # whole network-level half of the Tor-only guarantee rests on those two
+  # flags, so check them rather than assume the create applied.
+  local internal dns
+  podman network exists crypto || return 0
+  internal=$(podman network inspect crypto --format '{{.Internal}}' 2>/dev/null || echo unknown)
+  dns=$(podman network inspect crypto --format '{{.DNSEnabled}}' 2>/dev/null || echo unknown)
+  if [[ $internal == true && $dns == false ]]; then
+    return 0
+  fi
+  cat <<MIGRATE
+
+The existing 'crypto' network is not internal (internal=$internal, dns=$dns).
+Bitcoin and Monero on it can still reach the clearnet, so the network-level
+part of their Tor-only guarantee is not actually in force.  Recreating it --
+the daemons stop for a moment and come back on the same volumes and addresses.
+MIGRATE
+  systemctl stop monero-wallet-rpc.service "${SERVICES[@]}"
+  # RemainAfterExit keeps the network unit "active" long after podman ran, and
+  # the network cannot be removed while that unit still owns it.
+  systemctl stop crypto-network.service
+  if ! podman network rm crypto; then
+    cat <<'STUCK' >&2
+Could not remove the 'crypto' network.  Something is still attached to it.
+Find it with `podman ps -a --filter network=crypto`, detach or remove it, then
+rerun.  Refusing to continue: carrying on here would leave the deployment
+looking hardened while Bitcoin and Monero still had a route out.
+STUCK
+    return 1
+  fi
+  echo 'Removed; the crypto-network unit recreates it internally on next start.'
 }
 
 restart_chain_services() {

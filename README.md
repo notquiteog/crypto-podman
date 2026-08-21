@@ -4,24 +4,57 @@ This bundle deploys three full nodes, encrypted default wallets, and
 authenticated v3 onion-service RPC endpoints. No TCP port is published on the
 Debian host. Podman Quadlet keeps the five containers under systemd.
 
-Bitcoin and Monero reach the network **only over Tor**. Litecoin is the
-exception and peers over the clearnet: Tor exit relays reject port 9333, and
-the three onion addresses compiled into Litecoin Core are unreachable, so an
-onion-only Litecoin node never finds a peer and never syncs. All three RPC
-endpoints, Litecoin's included, are reachable only through an authenticated
-onion service.
+Bitcoin and Monero reach the network **only over Tor**, and that is enforced by
+the container network rather than by their own config files. There are two
+Podman networks:
 
-All three chains are configured to retain the least historical block data their
-supported safe pruning modes permit: Bitcoin Core and Litecoin Core use the
-550 MiB automatic block/undo target, and Monero uses pruned-block sync. They
+| Network | Members | Route to the internet |
+|---|---|---|
+| `crypto` | Arti, Bitcoin, Monero, Monero wallet RPC | none — `--internal --disable-dns` |
+| `crypto-egress` | Arti, Litecoin | yes |
+
+Arti is on both, and is the only way anything on `crypto` reaches the outside
+world. A daemon there cannot open a clearnet connection or resolve a hostname
+even if its configuration told it to, so a bad `onlynet` line or a DNS seed
+lookup fails closed instead of leaking.
+
+Litecoin is the exception and peers over the clearnet: Tor exit relays reject
+port 9333, and the three onion addresses compiled into Litecoin Core are
+unreachable, so an onion-only Litecoin node never finds a peer and never syncs.
+It therefore lives on `crypto-egress` with Arti. All four RPC endpoints,
+Litecoin's included, are reachable only through an authenticated onion service.
+
+**Upgrading an existing install:** `podman network create --ignore` leaves an
+already-existing network exactly as it was, so a host set up before this change
+would keep a `crypto` network that still has egress and DNS — with nothing to
+say the hardening had not applied. `setup.sh` and `update.sh --redeploy` both
+check the live network's flags and rebuild it when they do not match, which
+stops the daemons briefly. They refuse to continue if something is still
+attached to the old network, rather than leave you looking hardened while
+Bitcoin and Monero still have a route out. To check by hand:
+
+```bash
+sudo podman network inspect crypto --format 'internal={{.Internal}} dns={{.DNSEnabled}}'
+```
+
+All three chains are pruned. Bitcoin Core and Litecoin Core use a 10000 MiB
+(~10 GB) automatic block/undo target, and Monero uses pruned-block sync. They
 still fully validate the chain, but cannot provide old blocks, historical
-transaction lookups, rescans, or full initial-sync service to other peers.
+transaction lookups, or full initial-sync service to other peers.
+
+That target is deliberately well above Core's 550 MiB minimum. The prune depth
+is exactly the depth a wallet rescan can reach, so 550 MiB would leave the
+captured recovery material (see "Wallet recovery material") restorable only
+against roughly a day of chain. 10 GB buys about a month on Bitcoin and several
+months on Litecoin, for about 19 GB of extra disk across the two.
 
 ## Before installing
 
 1. Use a fresh, supported Debian 13 host with enough fast, redundant storage.
-   A non-pruned Bitcoin node alone currently needs hundreds of GB; plan disk
-   capacity and backups before syncing.
+   As configured, budget roughly 150 GB and grow from there: about 22 GB for
+   Bitcoin (10 GB of blocks plus chainstate), about 13 GB for Litecoin, and
+   about 60 GB for pruned Monero, which is by far the largest consumer. A
+   non-pruned Bitcoin node would instead need hundreds of GB.
 2. Review the two pinned build base images, or replace them with your own.
    `setup.sh` ships a reviewed, digest-pinned default for each, so a clean
    checkout installs with no arguments.  Overriding is still allowed, but the
@@ -111,8 +144,9 @@ corresponding Containerfile. Changing a version means updating both the version
 and its checksum together.
 
 Those digests are the images this bundle was tested against: Bitcoin Core
-31.1.0, Litecoin Core 0.21.5.5, and Monero 0.18.4.6. Review them yourself
-before trusting them with funds. If you substitute others, note that the
+31.1, Litecoin Core 0.21.5.6, and Monero 0.18.5.1 — the versions in the table
+above and in `containers/*.Containerfile`, which are the only places a version
+is declared. Review them yourself before trusting them with funds. If you substitute others, note that the
 Quadlets bypass each image's entrypoint and invoke `bitcoind`, `litecoind`,
 `monerod`, and `monero-wallet-rpc` directly, so the replacement must ship those
 binaries; the Monero image must provide `monero-wallet-cli` and
@@ -211,8 +245,24 @@ subkeys, and pinning one would break the moment it is rotated.
 
 ### What to automate, and what not to
 
-`--check` is safe to run on a timer. Applying is a different question per
-component:
+`--check` is safe to run on a timer, and `setup.sh` installs one:
+`crypto-update-check.timer` runs it daily with up to four hours of jitter, and
+`Persistent=true` so a missed day is caught up rather than skipped.
+
+```bash
+systemctl list-timers crypto-update-check.timer
+journalctl -u crypto-update-check.service
+```
+
+`setup.sh` enables the timer as its last step, and because `Persistent=true`
+has no stamp file to read on a fresh install, the first check runs right then.
+The unit records the path the bundle was installed from, so moving the bundle
+breaks the timer — rerun `setup.sh` from the new location to repoint it. A
+non-zero exit is deliberate signal rather than noise: it means a component was
+unreachable, or that a new release failed its signature threshold and was
+reported `BLOCKED`. Both show up in `systemctl --failed`.
+
+Applying is a different question per component:
 
 - **`base` and `rust`, plus host packages** — reasonable to apply on a schedule.
   This is where most CVEs are, the blast radius of a bad one is small, and it is
@@ -259,8 +309,29 @@ moved out of the chain data directory into the secrets directory, because
 `dumpwallet` writes every private key in cleartext wherever it is told to.
 
 This material is strictly more dangerous than the RPC credentials: it spends the
-coins with no password at all. Copy it offline and delete the server-side files
-once you have.
+coins with no password at all. Until it is off the server, the wallet encryption
+is decorative — the cleartext master keys sit in the same directory as the
+wallets they protect. Copy it offline, verify that backup, then:
+
+```bash
+sudo ./setup.sh --shred-recovery
+```
+
+That shreds `wallet-recovery.txt`, `bitcoin-wallet-descriptors.json`,
+`litecoin-wallet-dump.txt` and `monero-default-wallet-recovery.txt`, after
+requiring you to type `SHRED`. It leaves the RPC credentials and wallet
+passphrases alone, since the daemons need those to run.
+
+Three things to know before you do it:
+
+* **The Monero mnemonic exists nowhere else on the host.** Afterwards it can
+  only be recovered from the wallet itself, using the wallet password from
+  `rpc-credentials.env` with `monero-wallet-cli`.
+* **The Bitcoin and Litecoin exports are derived from their wallets**, so a
+  later full run of `setup.sh` recreates them. Shred again after any such run.
+* `shred` cannot promise much on a copy-on-write or journalling filesystem, or
+  on flash with wear levelling. Treat it as closing the obvious hole, not as
+  forensic erasure.
 
 ## Reboots
 
@@ -302,7 +373,12 @@ What this deployment enforces, and what it does not.
 Enforced:
 
 * No port is published to the host. Every listener exists only inside the
-  private Podman network; the only way in is an onion service.
+  private Podman networks; the only way in is an onion service.
+* Bitcoin, Monero and the Monero wallet RPC have no route to the internet at
+  all. `crypto.network` is created `--internal --disable-dns`, so their
+  Tor-only posture survives a bad config rather than depending on one. Only
+  Arti (which needs Tor) and Litecoin (which cannot use it) are on
+  `crypto-egress.network`.
 * All four RPC endpoints require credentials. Bitcoin and Litecoin use salted
   `rpcauth` hashes (the plaintext password is never stored in a file the daemon
   reads); Monero's daemon and wallet RPC use HTTP digest auth. Unauthenticated
@@ -311,7 +387,8 @@ Enforced:
   and a read-only root filesystem. State exists only in the mounted volumes.
 * Daemon binaries are built from upstream signed releases, not third-party
   images. See the provenance table above.
-* Secrets are mode 0600 in a 0700 directory, and wallet directories are 0700.
+* Secrets are mode 0600 in a 0700 directory, and both the wallet directories
+  and the chain data directories are 0700.
 * Bitcoin's peers are onion-only; verify with `getpeerinfo`.
 
 Not enforced, and worth understanding before funding anything:
@@ -328,13 +405,56 @@ Not enforced, and worth understanding before funding anything:
   per-request confirmation. Anyone who obtains its onion address *and* its
   credentials can transfer the balance. Bitcoin and Litecoin are better off
   here: their wallets stay encrypted and a send needs an explicit unlock.
-* **The onion layer itself is not access-controlled.** Anyone who learns an
-  onion address can reach the RPC port and attempt authentication. Treat the
-  addresses as secrets. Arti supports restricted discovery (client
-  authorization) if you later want a second gate.
+* **The onion layer is not access-controlled by default.** Anyone who learns an
+  onion address can reach the RPC port and attempt authentication, so treat the
+  addresses as secrets. Restricted discovery closes this and is shipped ready to
+  turn on — see "Restricted discovery" below. It is off by default because
+  enabling it without first authorizing a client locks you out of that service.
 * **Litecoin's provenance is weaker** than the other two (single signature,
   expired key), and its P2P traffic is not routed over Tor. Its node is the
   least trustworthy component in this bundle.
+
+## Restricted discovery
+
+By default an onion address is the only thing standing between the internet and
+an RPC login prompt. Restricted discovery adds a real second gate: Arti encrypts
+the service descriptor to a set of x25519 client keys, so a client without a key
+cannot even find the service, let alone attempt to authenticate.
+
+This bundle ships it ready but **off**, in two halves. `arti` is compiled with
+the `restricted-discovery` cargo feature (see `containers/arti.Containerfile`),
+and `config/arti.toml` carries the configuration commented out. Both halves
+matter: Arti refuses to start on a configuration asking for client
+authorization when the feature was not compiled in, which would take all four
+services down at once. If your Arti image predates that Containerfile change,
+rebuild before touching the config:
+
+```bash
+sudo ./update.sh --redeploy arti
+```
+
+Then authorize a client. The service names are `bitcoin-rpc`, `litecoin-rpc`,
+`monero-rpc` and `monero-wallet-rpc`:
+
+```bash
+sudo ./setup.sh --add-rpc-client bitcoin-rpc laptop
+```
+
+That generates an x25519 keypair, records the public half in
+`/srv/crypto-daemons/arti/authorized_clients/bitcoin-rpc/laptop.auth`, and
+prints the private half once. The private key is never stored on the server;
+capture it when it is printed. For a C-tor client it goes in
+`ClientOnionAuthDir` as `<onion-address-without-.onion>:descriptor:x25519:<key>`.
+
+Only then uncomment that service's `restricted_discovery.enabled` line and its
+`key_dirs` block in `/etc/crypto-daemons/arti.toml`, and restart Arti.
+**Enabling a service whose key directory is empty publishes a descriptor nobody
+can decrypt, which locks you out of it.** Do one service, confirm you can still
+reach it from a client holding the key, and only then do the rest.
+
+The key format and directory layout follow C-tor's client-authorization
+convention. Verify the first service end to end before converting the others,
+and keep a way in — an unconverted service, or console access — while you do.
 
 ## Important operating notes
 
@@ -364,9 +484,19 @@ Not enforced, and worth understanding before funding anything:
   wallet, because Litecoin Core 0.21 rejects descriptor wallets outright. Both
   are encrypted and both auto-load through a `wallet=default` line that
   `setup.sh` appends once the wallet exists.
-* Pruned BTC/LTC nodes cannot rescan arbitrarily old blocks. Do not import an
-  already-used key into these default wallets unless you have an appropriate
-  rescan strategy or rebuild from an archival source.
+* Pruned BTC/LTC nodes can only rescan as far back as the blocks they still
+  hold -- roughly a month on Bitcoin and several months on Litecoin at the
+  10 GB target. Do not import an older already-used key into these default
+  wallets unless you have an appropriate rescan strategy or rebuild from an
+  archival source.
+* Changing `prune` is not retroactive. Raising it keeps more from the restart
+  onwards; blocks already deleted are gone, so a freshly raised target takes a
+  full window to become useful. Lowering it prunes back down immediately.
+  Neither direction needs a reindex, but going from pruned to unpruned does
+  require a full re-sync. To change it on a running host, edit
+  `/etc/crypto-daemons/{bitcoin,litecoin}.conf` and restart the two services;
+  `update.sh` does not touch configs, and re-running `setup.sh` would reinstall
+  them from this bundle.
 * Back up `/srv/crypto-daemons/arti/state` as it holds the onion-service keys.
   Back up daemon data only if the re-sync cost matters; do not back up it as a
   substitute for wallet-key backups.
@@ -374,6 +504,21 @@ Not enforced, and worth understanding before funding anything:
   prunable but does not immediately make its LMDB file smaller. Stop Monero and
   use the version-matched `monero-blockchain-prune` tool with a verified backup
   before expecting reclaimed host disk space.
+* Every container carries a health check, and all of them are **report-only**:
+  a failure shows in `podman ps` and `systemctl status` but restarts nothing.
+  That is deliberate — a subtly wrong check that restarts a money-handling
+  daemon is worse than no check at all. Once you have watched one be accurate
+  on your host, add `HealthOnFailure=kill` to that unit to make it act. Bitcoin
+  and Litecoin are checked with their own `-cli` against the cookie the daemon
+  writes; Monero, its wallet RPC and Arti are checked with a TCP connect,
+  because an RPC call there could fail on credentials and report a healthy
+  daemon as sick.
+* The daemon units order themselves `After=time-sync.target`, and `setup.sh`
+  enables `systemd-time-wait-sync` so that target is actually reached — on its
+  own the ordering is a no-op, because nothing pulls that target in by default.
+  If the host uses chrony or ntpsec instead of `systemd-timesyncd`, `setup.sh`
+  says so and leaves clock synchronisation to you. Both Core daemons and Monero
+  handle a badly skewed clock poorly.
 * Review firewall rules separately.  This bundle publishes no ports, but it
   does not overwrite an existing host firewall.
 * To update an image, stop the affected service cleanly, rerun the script with
@@ -390,4 +535,18 @@ sudo journalctl -u arti -u bitcoin -u litecoin -u monero -u monero-wallet-rpc -f
 ```
 
 `ss` should show no listener added by this bundle on the host.  All listeners
-exist only inside the private Podman network.
+exist only inside the private Podman networks.  `podman ps` shows each
+container's health state alongside its uptime.
+
+To confirm the internal network really has no way out — this should fail, and
+the DNS lookup should fail too:
+
+```bash
+sudo podman exec bitcoin bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' ; echo "exit=$?"
+```
+
+To see which network each container is on:
+
+```bash
+sudo podman ps --format '{{.Names}}' | xargs -I{} sh -c 'printf "%-18s " {}; podman inspect {} --format "{{range \$k, \$v := .NetworkSettings.Networks}}{{\$k}} {{\$v.IPAddress}} {{end}}"; echo'
+```

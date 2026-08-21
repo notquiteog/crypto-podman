@@ -1,13 +1,12 @@
 [Unit]
-Description=Litecoin Core (Tor-only, RPC via Arti onion service)
-After=arti.service
+Description=Litecoin Core (clearnet P2P, RPC via Arti onion service)
+After=arti.service time-sync.target
 Requires=arti.service
 
 [Container]
 Image=@@LITECOIN_IMAGE@@
 ContainerName=litecoin
-Network=crypto.network
-IP=10.89.0.12
+Network=crypto-egress.network:ip=10.89.1.12
 Volume=/srv/crypto-daemons/litecoin:/data
 Volume=/etc/crypto-daemons/litecoin.conf:/etc/litecoin/litecoin.conf:ro
 Volume=/etc/crypto-daemons/litecoin-rpcauth.conf:/etc/litecoin/rpcauth.conf:ro
@@ -23,6 +22,15 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp
 DropCapability=all
+# Report-only liveness; see the note in arti.container before enabling
+# HealthOnFailure=kill.  litecoin-cli authenticates with the .cookie the daemon
+# writes into /data, so this needs no credentials of its own.  The long start
+# period covers the block-index load, during which RPC is not yet answering.
+HealthCmd=litecoin-cli -datadir=/data getblockchaininfo
+HealthInterval=1m
+HealthStartPeriod=15m
+HealthTimeout=30s
+HealthRetries=3
 
 [Service]
 Restart=always
