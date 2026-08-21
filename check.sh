@@ -23,8 +23,10 @@ elif [[ ${ALLOW_NO_SHELLCHECK:-} == 1 ]]; then
   echo 'shellcheck not installed; syntax checked only (ALLOW_NO_SHELLCHECK=1).' >&2
 else
   # Exiting non-zero rather than passing quietly: `bash -n` finds parse errors
-  # and nothing else, and the constructs this bundle gets wrong are the ones
-  # shellcheck catches.  Set ALLOW_NO_SHELLCHECK=1 for a syntax-only run.
+  # and nothing else, while the constructs this bundle gets wrong are the ones
+  # the linter catches.  Set ALLOW_NO_SHELLCHECK=1 for a syntax-only run.
+  # (Do not open a comment with the linter's own name -- it reads that as a
+  # directive and fails to parse it.)
   echo 'shellcheck is not installed, so this is not a lint gate.' >&2
   echo 'Install it, or set ALLOW_NO_SHELLCHECK=1 to check syntax only.' >&2
   exit 1

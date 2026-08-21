@@ -472,8 +472,8 @@ CLIENT
 onion_address() {
   # The identity exists as soon as the service launches, but arti needs a moment
   # after start before the command answers.
-  local nickname=$1 attempt address
-  for attempt in {1..60}; do
+  local nickname=$1 address
+  for _ in {1..60}; do
     address=$(podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
       --nickname "$nickname" onion-address 2>/dev/null | tr -d '\r\n')
     if [[ -n $address ]]; then
