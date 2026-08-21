@@ -41,6 +41,8 @@ Environment:
   ARTI_RUST_IMAGE          Rust image used to compile arti, same digest rule.
                            Default:
                              $DEFAULT_ARTI_RUST_IMAGE
+  MIN_FREE_GIB             Free space required on $DATA_DIR before installing.
+                           Default 150, matching the README's budget.
   INSTALL_PODMAN_DESKTOP   yes/no; skips the interactive prompt.
   PODMAN_DESKTOP_USER      Desktop login to install Podman Desktop for,
                            required when that is enabled and you are root.
@@ -84,6 +86,55 @@ maybe_install_podman_desktop() {
       return 2
       ;;
   esac
+}
+
+warn_podman_version() {
+  # A support floor rather than a technical one: the Quadlet syntax used here
+  # also converts on podman 4.9, so refusing to run would be overreach, but this
+  # bundle is only tested against the 5.4 that Debian 13 ships.
+  local version major
+  version=$(podman --version 2>/dev/null | awk '{print $3}') || version=''
+  major=${version%%.*}
+  if [[ ! $major =~ ^[0-9]+$ ]] || (( major < 5 )); then
+    printf 'Found podman %s; this bundle is tested against 5.0 and later.\n' \
+      "${version:-none}" >&2
+  fi
+}
+
+require_free_space_on() {
+  # Refuse rather than skip when df cannot be read: a preflight that fails open
+  # is worse than none, because it is quiet about it.
+  local path=$1 need=$2 what=$3 have
+  have=$(df -BG --output=avail "$path" 2>/dev/null | tail -1 | tr -dc '0-9') || have=''
+  if [[ -z $have ]]; then
+    printf 'Could not read free space on %s (%s); refusing to continue.\n' \
+      "$path" "$what" >&2
+    exit 1
+  fi
+  if (( have < need )); then
+    printf 'Only %s GiB free on %s (%s); %s GiB is required.\n' \
+      "$have" "$path" "$what" "$need" >&2
+    printf 'Free space or move it to a larger filesystem; MIN_FREE_GIB lowers\n' >&2
+    printf 'the chain-data figure if you mean to run a smaller deployment.\n' >&2
+    exit 1
+  fi
+}
+
+require_free_space() {
+  # As configured the three chains want roughly 95 GB and grow from there.  A
+  # disk that fills during initial sync is the one failure here that can leave
+  # Monero's LMDB damaged, so check before spending an hour building images.
+  # The images are built into podman's store, which is regularly a different
+  # filesystem from the chain data, so both are checked.
+  local need=${MIN_FREE_GIB:-150} store
+  if [[ ! $need =~ ^[0-9]+$ ]]; then
+    printf 'MIN_FREE_GIB must be a whole number of GiB; got %q\n' "$need" >&2
+    exit 1
+  fi
+  store=$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null) || store=''
+  [[ -n $store && -d $store ]] || store=/var/lib
+  require_free_space_on "$DATA_DIR" "$need" 'chain data'
+  require_free_space_on "$store" 20 'image builds'
 }
 
 enable_time_sync() {
@@ -158,9 +209,11 @@ ensure_core_wallet() {
   wait_for_core_rpc "$container" "$cli"
   wallet_list=$(podman exec "$container" "$cli" -datadir=/data listwalletdir)
   if ! grep -Eq '"name"[[:space:]]*:[[:space:]]*"default"' <<<"$wallet_list"; then
-    podman exec "$container" "$cli" -datadir=/data -named createwallet \
-      wallet_name=default disable_private_keys=false blank=false \
-      "passphrase=${!passphrase_var}" avoid_reuse=true "descriptors=${descriptors}" >/dev/null
+    # -stdin reads the named arguments from stdin rather than argv, so the
+    # passphrase never appears in the host process table.
+    printf '%s\n' wallet_name=default disable_private_keys=false blank=false \
+      "passphrase=${!passphrase_var}" avoid_reuse=true "descriptors=${descriptors}" |
+      podman exec -i "$container" "$cli" -datadir=/data -named -stdin createwallet >/dev/null
   fi
   podman exec "$container" "$cli" -datadir=/data -rpcwallet=default getwalletinfo >/dev/null
   if ! grep -q "^${address_var}=" "$PREFIX/secrets/default-wallet-addresses.env"; then
@@ -219,8 +272,10 @@ autoload_wallet() {
 capture_bitcoin_descriptors() {
   local out="$PREFIX/secrets/bitcoin-wallet-descriptors.json"
   [[ -s $out ]] && return 0
-  podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default \
-    walletpassphrase "$BITCOIN_WALLET_PASSPHRASE" 60 >/dev/null
+  # -stdinwalletpassphrase, for the same reason as createwallet above.
+  printf '%s\n' "$BITCOIN_WALLET_PASSPHRASE" |
+    podman exec -i bitcoin bitcoin-cli -datadir=/data -rpcwallet=default \
+      -stdinwalletpassphrase walletpassphrase 60 >/dev/null
   podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default \
     listdescriptors true >"$out"
   podman exec bitcoin bitcoin-cli -datadir=/data -rpcwallet=default walletlock >/dev/null
@@ -230,8 +285,9 @@ capture_bitcoin_descriptors() {
 capture_litecoin_dump() {
   local out="$PREFIX/secrets/litecoin-wallet-dump.txt"
   [[ -s $out ]] && return 0
-  podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default \
-    walletpassphrase "$LITECOIN_WALLET_PASSPHRASE" 60 >/dev/null
+  printf '%s\n' "$LITECOIN_WALLET_PASSPHRASE" |
+    podman exec -i litecoin litecoin-cli -datadir=/data -rpcwallet=default \
+      -stdinwalletpassphrase walletpassphrase 60 >/dev/null
   podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default \
     dumpwallet /data/wallet-dump.txt >/dev/null
   podman exec litecoin litecoin-cli -datadir=/data -rpcwallet=default walletlock >/dev/null
@@ -342,9 +398,20 @@ WARN
     echo 'Aborted; nothing was removed.'
     return 1
   fi
+  local rc=0
   for f in "${present[@]}"; do
-    shred -u -z -- "$f" && printf '  shredded %s\n' "$f"
+    if shred -u -z -- "$f"; then
+      printf '  shredded %s\n' "$f"
+    else
+      printf '  FAILED to shred %s -- it is still on disk\n' "$f" >&2
+      rc=1
+    fi
   done
+  if (( rc )); then
+    echo 'Some files could not be destroyed; the spend keys they hold are still' >&2
+    echo 'on this server.  Investigate before assuming they are gone.' >&2
+    return 1
+  fi
   echo 'Done.  setup.sh --print-recovery will now report the material as unavailable.'
 }
 
@@ -502,7 +569,19 @@ SUMMARY
 }
 
 install_configs() {
-  install -m 0644 "$BUNDLE_DIR/config/arti.toml" "$PREFIX/arti.toml"
+  # arti.toml is the one config an operator is expected to edit, to turn on
+  # restricted discovery.  Reinstalling it would silently revert that gate in
+  # front of a spend-capable wallet, so install it once and report drift after.
+  if [[ ! -e $PREFIX/arti.toml ]]; then
+    install -m 0644 "$BUNDLE_DIR/config/arti.toml" "$PREFIX/arti.toml"
+  elif ! cmp -s "$BUNDLE_DIR/config/arti.toml" "$PREFIX/arti.toml"; then
+    # Show the difference rather than just announcing one: an operator who has
+    # enabled restricted discovery needs to merge bundle changes by hand, and
+    # cannot do that from a warning that does not say what changed.
+    echo "Keeping the existing $PREFIX/arti.toml, which differs from this" >&2
+    echo 'bundle. Merge anything you want from the diff below by hand:' >&2
+    diff -u "$PREFIX/arti.toml" "$BUNDLE_DIR/config/arti.toml" >&2 || true
+  fi
   install -m 0644 "$BUNDLE_DIR/config/bitcoin.conf" "$PREFIX/bitcoin.conf"
   install -m 0644 "$BUNDLE_DIR/config/litecoin.conf" "$PREFIX/litecoin.conf"
   # monerod has no includeconf equivalent; build its config without printing its secret.
@@ -527,6 +606,7 @@ main() {
   # check fails, so it is a hard dependency of the bundle, not an extra.
   apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
     ca-certificates openssl xxd gnupg curl jq
+  warn_podman_version
   maybe_install_podman_desktop
   enable_time_sync
 
@@ -542,8 +622,19 @@ main() {
   # Empty unless --add-rpc-client is used; Arti only reads these when a
   # service's restricted_discovery block is uncommented in arti.toml.
   install -d -m 0700 "$DATA_DIR/arti/authorized_clients"
+  # Created here rather than on first use so the update timer's unit can name it
+  # in ReadWritePaths= under ProtectSystem=strict.
+  install -d -m 0700 "$KEYRING_DIR"
+  require_free_space
   initialize_secrets
   install_configs
+  # install_configs reinstalls both Core configs from the bundle, dropping the
+  # wallet=default line a previous run appended.  Put it back before the restart
+  # below, or a re-run brings the daemons up with no wallet loaded and the
+  # -rpcwallet=default probe in ensure_core_wallet aborts the install.  The
+  # existence guard inside makes this a no-op on a first install.
+  autoload_wallet bitcoin "$PREFIX/bitcoin.conf"
+  autoload_wallet litecoin "$PREFIX/litecoin.conf"
   write_images_env
 
   build_all_images
@@ -562,6 +653,7 @@ main() {
   capture_litecoin_dump
   ensure_monero_wallet
   systemctl restart monero-wallet-rpc.service
+  prune_old_images
   # Last, not with the other installs: Persistent=true and no stamp file means
   # the timer fires its first check the moment it is enabled, and that is worth
   # far less noise once the install has actually finished.

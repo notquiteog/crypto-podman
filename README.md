@@ -51,10 +51,17 @@ months on Litecoin, for about 19 GB of extra disk across the two.
 ## Before installing
 
 1. Use a fresh, supported Debian 13 host with enough fast, redundant storage.
+   Podman 5.0 or later is expected — Debian 13 ships 5.4, and that is what this
+   bundle is tested against. `setup.sh` warns on anything older rather than
+   refusing; the Quadlet syntax used here does still convert on Podman 4.9.
    As configured, budget roughly 150 GB and grow from there: about 22 GB for
    Bitcoin (10 GB of blocks plus chainstate), about 13 GB for Litecoin, and
    about 60 GB for pruned Monero, which is by far the largest consumer. A
-   non-pruned Bitcoin node would instead need hundreds of GB.
+   non-pruned Bitcoin node would instead need hundreds of GB. `setup.sh` refuses
+   to start below that budget, checking both the chain-data filesystem and
+   podman's image store, which are often not the same one; set `MIN_FREE_GIB`
+   to lower the chain-data figure deliberately. A disk that fills during initial
+   sync is the one failure here that can leave Monero's database damaged.
 2. Review the two pinned build base images, or replace them with your own.
    `setup.sh` ships a reviewed, digest-pinned default for each, so a clean
    checkout installs with no arguments.  Overriding is still allowed, but the
@@ -79,10 +86,21 @@ or a failed attempt is safe.  It asks one optional question (whether to install
 Podman Desktop, default no); set `INSTALL_PODMAN_DESKTOP=no` to skip even that
 and run completely unattended.
 
+A re-run reinstalls `bitcoin.conf`, `litecoin.conf` and `monero.conf` from this
+bundle, so hand edits to those (a changed `prune`, for example) do not survive
+one. `arti.toml` is the exception and is installed only once: reverting it would
+silently turn restricted discovery back off in front of a spend-capable wallet.
+A re-run prints a diff when the installed copy has drifted from the bundle's.
+That cuts both ways — a change to `arti.toml` in a future version of this bundle
+will not reach an existing install on its own; merge it from that diff.
+
 Three scripts make up the bundle: `setup.sh` installs, `update.sh` maintains
 (see "Applying security updates"), and `lib.sh` holds what they share — the
 pins, the image build steps, and the Quadlet install.  `lib.sh` is sourced, not
-run.
+run. `check.sh` runs `bash -n` over all four and then `shellcheck -x`, failing
+if shellcheck is absent — `bash -n` alone finds parse errors and nothing else,
+so it is not a lint gate on its own; `ALLOW_NO_SHELLCHECK=1` gives a syntax-only
+run. It is for whoever edits the bundle; no deployed host needs it.
 
 Expect it to take a while: it compiles arti from source and downloads three
 daemon release tarballs before the nodes ever start syncing.
@@ -239,6 +257,9 @@ system trusts.
 Bitcoin Core requires four independent Guix builder signatures; Monero and
 Litecoin publish one signature each. Litecoin's signing key is expired, and
 `--check` prints `[signing key EXPIRED]` on every report rather than hiding it.
+A *revoked* key is different: it is not counted toward the threshold at all, and
+`--check` says so. One Bitcoin builder rotating a key therefore costs one
+signature out of eleven rather than blocking the release.
 
 Fingerprints are primary keys, not subkeys: several Bitcoin builders sign with
 subkeys, and pinning one would break the moment it is rotated.
@@ -372,6 +393,11 @@ What this deployment enforces, and what it does not.
 
 Enforced:
 
+* Arti's SOCKS proxy — the one listener here that takes no credentials — is
+  bound to its internal-bridge address rather than to `0.0.0.0`, so it does not
+  also appear on the egress network. Only Bitcoin and Monero proxy through it,
+  and both are internal. On a host installed before this change, the deployed
+  `arti.toml` keeps its old `socks_listen`; a re-run prints the diff to apply.
 * No port is published to the host. Every listener exists only inside the
   private Podman networks; the only way in is an onion service.
 * Bitcoin, Monero and the Monero wallet RPC have no route to the internet at
@@ -410,8 +436,20 @@ Not enforced, and worth understanding before funding anything:
   addresses as secrets. Restricted discovery closes this and is shipped ready to
   turn on — see "Restricted discovery" below. It is off by default because
   enabling it without first authorizing a client locks you out of that service.
+* **Podman bridges are routable from the host itself.** Nothing is published,
+  so nothing is reachable from the LAN, but root on this host can reach every
+  container listener directly by IP. That is not a new exposure — root here can
+  spend the coins anyway — but `ss -ltnp` showing no listener is a statement
+  about the host's own ports, not about unreachability.
+* **The daily update check runs on the host, not in a container**, so it
+  reaches bitcoincore.org, getmonero.org, GitHub, crates.io and Docker Hub over
+  the clearnet from this host's own IP, on a schedule. Disable the timer and
+  run `--check` from elsewhere if that pattern matters to you.
 * **Litecoin's provenance is weaker** than the other two (single signature,
-  expired key), and its P2P traffic is not routed over Tor. Its node is the
+  expired key), and its P2P traffic is not routed over Tor. Its DNS seed
+  lookups leave the host in the clear too, through the egress network's DNS;
+  `dnsseed=0` narrows that to the fixed seeds compiled in, at some cost to
+  bootstrap reliability. Its node is the
   least trustworthy component in this bundle.
 
 ## Restricted discovery
@@ -447,7 +485,9 @@ capture it when it is printed. For a C-tor client it goes in
 `ClientOnionAuthDir` as `<onion-address-without-.onion>:descriptor:x25519:<key>`.
 
 Only then uncomment that service's `restricted_discovery.enabled` line and its
-`key_dirs` block in `/etc/crypto-daemons/arti.toml`, and restart Arti.
+`key_dirs` block in `/etc/crypto-daemons/arti.toml`, and restart Arti. That file
+is installed once and never reinstalled, so a later `setup.sh` run leaves your
+edits in place.
 **Enabling a service whose key directory is empty publishes a descriptor nobody
 can decrypt, which locks you out of it.** Do one service, confirm you can still
 reach it from a client holding the key, and only then do the rest.
@@ -489,6 +529,19 @@ and keep a way in — an unconverted service, or console access — while you do
   10 GB target. Do not import an older already-used key into these default
   wallets unless you have an appropriate rescan strategy or rebuild from an
   archival source.
+* Each daemon container is given an explicit `--stop-timeout` (nine minutes for
+  the three chains, four for the wallet RPC). Quadlet stops containers with
+  `podman rm -f`, whose grace period is the container's own stop timeout —
+  10 seconds by default — and *not* the unit's `TimeoutStopSec`, which only
+  bounds how long systemd waits for that command. Without it both Core daemons
+  are killed mid-flush on every restart and reboot and replay blocks on the way
+  back up. If you add a daemon here, give it the same treatment.
+* `setup.sh` and `update.sh` remove this bundle's own superseded
+  `localhost/crypto-*` image tags after a successful restart. Nothing else is
+  touched, and an image still in use is left alone. Dangling layers from the
+  multi-stage builds are deliberately *not* swept: `podman image prune` cannot
+  be scoped to one bundle, and this host may not be dedicated to it. Run it
+  yourself if it is.
 * Changing `prune` is not retroactive. Raising it keeps more from the restart
   onwards; blocks already deleted are gone, so a freshly raised target takes a
   full window to become useful. Lowering it prunes back down immediately.
@@ -497,7 +550,8 @@ and keep a way in — an unconverted service, or console access — while you do
   `/etc/crypto-daemons/{bitcoin,litecoin}.conf` and restart the two services;
   `update.sh` does not touch configs, and re-running `setup.sh` would reinstall
   them from this bundle.
-* Back up `/srv/crypto-daemons/arti/state` as it holds the onion-service keys.
+* Back up `/srv/crypto-daemons/arti` as it holds the onion-service keys under
+  `state/`, and any client authorizations under `authorized_clients/`.
   Back up daemon data only if the re-sync cost matters; do not back up it as a
   substitute for wallet-key backups.
 * For an already-synced Monero data directory, `prune-blockchain=1` marks data

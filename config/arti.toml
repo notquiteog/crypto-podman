@@ -5,8 +5,12 @@ watch_configuration = false
 allow_running_as_root = true
 
 [proxy]
-# Bound only inside the private Podman bridge; never published to the host.
-socks_listen = "0.0.0.0:9150"
+# Bound to the internal bridge only, and never published to the host.  Arti is
+# dual-homed, so 0.0.0.0 here would also put this -- the one listener in the
+# bundle that takes no credentials -- on the egress network.  Nothing there
+# needs it: only Bitcoin and Monero proxy through Arti, and both are internal.
+# This address must match arti.container's crypto.network ip=.
+socks_listen = "10.89.0.10:9150"
 
 [storage]
 cache_dir = "/var/lib/arti/cache"

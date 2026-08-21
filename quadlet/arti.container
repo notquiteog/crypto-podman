@@ -31,7 +31,11 @@ DropCapability=all
 # HealthOnFailure=kill once you have watched a check be accurate on your host;
 # a subtly wrong check that restarts a daemon is worse than no check at all.
 # bash, not sh: /dev/tcp is a bash builtin and Debian's sh is dash.
-HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/9150"
+# 10.89.0.10, not 127.0.0.1: arti.toml binds SOCKS to this container's bridge
+# address only, so nothing is listening on loopback.  Keep these three copies of
+# the address -- Network= above, socks_listen in arti.toml, and this line -- in
+# step with each other.
+HealthCmd=bash -c "exec 3<>/dev/tcp/10.89.0.10/9150"
 HealthInterval=1m
 HealthStartPeriod=5m
 HealthTimeout=20s

@@ -14,6 +14,10 @@ readonly BUNDLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # Signature checking uses a keyring of its own rather than root's, so importing
 # a release key never widens what the rest of the system trusts.
 readonly KEYRING_DIR="$PREFIX/keys"
+# podman tars the build context and hands it to the builder.  $PREFIX holds the
+# wallet spend keys, so builds get a directory of their own that is kept empty;
+# no Containerfile here reads anything from its context.
+readonly BUILD_CONTEXT="$PREFIX/build"
 readonly FINGERPRINTS="$BUNDLE_DIR/keys/fingerprints.txt"
 readonly SERVICES=(arti.service bitcoin.service litecoin.service monero.service)
 
@@ -90,6 +94,9 @@ install_template() {
     -e "s|@@LITECOIN_IMAGE@@|${LITECOIN_IMAGE}|g" \
     -e "s|@@MONERO_IMAGE@@|${MONERO_IMAGE}|g" \
     "$input" >"$output"
+  # Written under this script's umask 077; every caller installs a unit file,
+  # and unit files are 0644 like the two .network files installed beside them.
+  chmod 0644 "$output"
 }
 
 build_daemon_image() {
@@ -97,10 +104,15 @@ build_daemon_image() {
   # checksum pinned in the file itself, so a tampered download fails the build.
   local chain=$1 tag=$2
   install -m 0644 "$BUNDLE_DIR/containers/$chain.Containerfile" "$PREFIX/$chain.Containerfile"
-  podman build --pull=always --tag "$tag" \
+  install -d -m 0755 "$BUILD_CONTEXT"
+  # --pull=missing, not podman build's default of always: both bases are
+  # digest-pinned and require_digest refuses anything else, so a re-pull cannot
+  # produce different bytes than the local copy -- it only makes every rebuild
+  # depend on Docker Hub being reachable.
+  podman build --pull=missing --tag "$tag" \
     --build-arg "FETCH_IMAGE=$BASE_IMAGE" \
     --build-arg "RUNTIME_IMAGE=$BASE_IMAGE" \
-    --file "$PREFIX/$chain.Containerfile" "$PREFIX"
+    --file "$PREFIX/$chain.Containerfile" "$BUILD_CONTEXT"
 }
 
 wait_for_core_rpc() {
@@ -129,10 +141,11 @@ resolve_base_images() {
 
 build_arti_image() {
   install -m 0644 "$BUNDLE_DIR/containers/arti.Containerfile" "$PREFIX/arti.Containerfile"
-  podman build --pull=always --tag "$ARTI_IMAGE" \
+  install -d -m 0755 "$BUILD_CONTEXT"
+  podman build --pull=missing --tag "$ARTI_IMAGE" \
     --build-arg "RUST_IMAGE=$ARTI_RUST_IMAGE" \
     --build-arg "RUNTIME_IMAGE=$BASE_IMAGE" \
-    --file "$PREFIX/arti.Containerfile" "$PREFIX"
+    --file "$PREFIX/arti.Containerfile" "$BUILD_CONTEXT"
 }
 
 build_all_images() {
@@ -161,9 +174,6 @@ install_update_timer() {
   # rerun setup.sh from the new location to repoint it.
   install_template "$BUNDLE_DIR/systemd/crypto-update-check.service" \
     /etc/systemd/system/crypto-update-check.service
-  # install_template redirects under this script's umask 077; systemd is happy
-  # either way, but keep it consistent with every other unit file here.
-  chmod 0644 /etc/systemd/system/crypto-update-check.service
   install -m 0644 "$BUNDLE_DIR/systemd/crypto-update-check.timer" \
     /etc/systemd/system/crypto-update-check.timer
   systemctl daemon-reload
@@ -226,6 +236,21 @@ write_images_env() {
     printf 'BASE_IMAGE=%s\n' "$BASE_IMAGE"
     printf 'ARTI_RUST_IMAGE=%s\n' "$ARTI_RUST_IMAGE"
   } >"$PREFIX/images.env"
+}
+
+prune_old_images() {
+  # Every version bump leaves the previous tag behind, on the same filesystem as
+  # the wallets.  Only this bundle's own superseded tags are removed, and never
+  # fatally: an image still in use by a running container refuses to go, which
+  # is the correct outcome.  Dangling layers left by the multi-stage builds are
+  # deliberately not swept -- `podman image prune` is not scoped to this bundle,
+  # and this host may not be dedicated to it.  See the README.
+  local ref repo
+  for ref in "$ARTI_IMAGE" "$BITCOIN_IMAGE" "$LITECOIN_IMAGE" "$MONERO_IMAGE"; do
+    repo=${ref%:*}
+    podman images --format '{{.Repository}}:{{.Tag}}' "$repo" 2>/dev/null |
+      grep -vxF "$ref" | xargs -r podman rmi >/dev/null 2>&1 || true
+  done
 }
 
 restart_all_services() {

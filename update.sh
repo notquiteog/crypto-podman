@@ -51,6 +51,21 @@ fetch() { curl -fsSL --max-time 60 -A "$UA" "$@" </dev/null; }
 # file, which reads as a zero-signature verification on the second chain.
 gpgr()  { gpg --batch --yes --no-tty --homedir "$KEYRING_DIR" "$@"; }
 
+# Upstream strings reach a URL, a Containerfile ARG, or a sed replacement that
+# rewrites lib.sh -- which root sources on the very next invocation.  Nothing
+# gets that far before it has been checked to look like what it claims to be.
+readonly VERSION_RE='^[0-9]+(\.[0-9]+)*$'
+readonly DIGEST_RE='^sha256:[0-9a-f]{64}$'
+readonly SHA256_RE='^[0-9a-f]{64}$'
+
+validate() {
+  local what=$1 value=$2 pattern=$3
+  if [[ ! $value =~ $pattern ]]; then
+    printf 'Refusing %s: upstream returned %q\n' "$what" "$value" >&2
+    return 1
+  fi
+}
+
 pinned_keys()      { awk -v c="$1" '$1=="key" && $2==c {print toupper($3)}' "$FINGERPRINTS"; }
 pinned_threshold() { awk -v c="$1" '$1=="threshold" && $2==c {print $3}' "$FINGERPRINTS"; }
 
@@ -60,7 +75,8 @@ import_keys() {
   install -d -m 0700 "$KEYRING_DIR"
   local -a lines=()
   mapfile -t lines <"$FINGERPRINTS"
-  local line kw chain fp url got tmp=$WORK/key
+  local line kw chain fp url tmp=$WORK/key
+  local -a got=()
   for line in "${lines[@]}"; do
     read -r kw chain fp url <<<"$line"
     [[ ${kw:-} == key ]] || continue
@@ -70,10 +86,19 @@ import_keys() {
       printf 'Could not fetch key %s from %s\n' "$fp" "$url" >&2
       return 1
     fi
-    got=$(gpg --batch --with-colons --import-options show-only --import "$tmp" 2>/dev/null |
-          awk -F: '/^fpr:/{print toupper($10); exit}')
-    if [[ ${got:-} != "$fp" ]]; then
-      printf 'Refusing key from %s: got %s, pinned %s\n' "$url" "${got:-none}" "$fp" >&2
+    # gpgr, not bare gpg: the latter falls back to root's ~/.gnupg, which this
+    # bundle deliberately never touches and which the update timer's sandbox
+    # makes read-only.  show-only implies --dry-run, so nothing is imported yet.
+    if ! gpgr --with-colons --import-options show-only --import "$tmp" >"$tmp.list" 2>/dev/null; then
+      printf 'Could not read the key file fetched from %s\n' "$url" >&2
+      return 1
+    fi
+    # Every primary fingerprint in the file, not just the first: the import
+    # below takes the whole file, so checking only the first key would let an
+    # unpinned one ride along behind a pinned one.
+    mapfile -t got < <(awk -F: '$1=="pub"{p=1} $1=="fpr" && p {print toupper($10); p=0}' "$tmp.list")
+    if (( ${#got[@]} != 1 )) || [[ ${got[0]} != "$fp" ]]; then
+      printf 'Refusing key from %s: got %s, pinned %s\n' "$url" "${got[*]:-none}" "$fp" >&2
       return 1
     fi
     gpgr --import "$tmp" >/dev/null 2>&1
@@ -87,7 +112,14 @@ verify_manifest() {
   local chain=$1 version=$2
   local manifest=$WORK/manifest sig=$WORK/manifest.asc plain=$WORK/plain
   local status=$WORK/status tarball need good=0 fp
+  validate "the version of $chain" "$version" "$VERSION_RE" || return 1
   need=$(pinned_threshold "$chain")
+  # An empty threshold would be arithmetic zero below, which reads as "no
+  # signatures required" -- exactly backwards for a missing trust anchor.
+  if [[ ! $need =~ ^[1-9][0-9]*$ ]]; then
+    printf 'refusing %s: no usable threshold for it in %s\n' "$chain" "$FINGERPRINTS" >&2
+    return 1
+  fi
   # Never let one chain's artefacts survive into the next chain's check.
   rm -f -- "$manifest" "$sig" "$plain"
   : >"$status"
@@ -119,8 +151,17 @@ verify_manifest() {
   # Count distinct PRIMARY keys that both signed validly and are pinned for this
   # chain.  VALIDSIG's last field is the primary key; several Bitcoin builders
   # sign with subkeys, whose fingerprints would never match a pinned primary.
+  # gpg emits REVKEYSIG (or EXPKEYSIG, or GOODSIG) immediately before the
+  # VALIDSIG for the same signature, so a revoked signer can be dropped from the
+  # tally without blocking the manifest: Bitcoin pins eleven builder keys and
+  # needs four, and one builder rotating a key is routine upstream housekeeping,
+  # not evidence against the release.  An expired key still counts -- Litecoin's
+  # only signature is one -- and is reported instead.
   local -a signers=()
-  mapfile -t signers < <(awk '/^\[GNUPG:\] VALIDSIG/{print toupper($NF)}' "$status" | sort -u)
+  mapfile -t signers < <(awk '$2=="REVKEYSIG" {rev=1; next}
+                              $2=="GOODSIG" || $2=="EXPKEYSIG" {rev=0; next}
+                              $2=="VALIDSIG" {if (!rev) print toupper($NF); rev=0}' \
+                              "$status" | sort -u)
   for fp in "${signers[@]:-}"; do
     [[ -n $fp ]] || continue
     if pinned_keys "$chain" | grep -qxF "$fp"; then
@@ -135,7 +176,11 @@ verify_manifest() {
   else
     printf '0\n' >"$WORK/expired"
   fi
-
+  if grep -q '^\[GNUPG:\] REVKEYSIG' "$status"; then
+    printf '1\n' >"$WORK/revoked"
+  else
+    printf '0\n' >"$WORK/revoked"
+  fi
   if (( good < need )); then
     printf 'refusing %s %s: %d trusted signature(s), need %d\n' \
       "$chain" "$version" "$good" "$need" >&2
@@ -180,15 +225,24 @@ report() { printf '  %-9s %-12s %s\n' "$1" "$2" "$3"; }
 
 cmd_check() {
   local comp pinned latest sha note rc=0
-  import_keys
+  # Non-fatal, for the same reason the per-component fetches below are: all the
+  # key URLs share one host, and an outage there must not cost the whole report.
+  # Chains whose keys are missing then report BLOCKED, with this line above.
+  if ! import_keys; then
+    printf 'Some release keys could not be fetched; chain checks may report BLOCKED.\n' >&2
+    rc=1
+  fi
   printf '\nComponent  Status       Detail\n'
   printf -- '---------------------------------------------------------------\n'
   for comp in "${COMPONENTS[@]}"; do
     pinned=$(pinned_version "$comp")
     case $comp in
-      base) latest=$(latest_digest library/debian trixie-slim) ;;
-      rust) latest=$(latest_digest library/rust 1-trixie) ;;
-      *)    latest=$(latest_version "$comp") ;;
+      # Clear rather than `|| true`: latest is declared once outside the loop,
+      # so a partial transfer must not leave a stale value to be read as a
+      # bogus 'current' row for the next component.
+      base) latest=$(latest_digest library/debian trixie-slim) || latest='' ;;
+      rust) latest=$(latest_digest library/rust 1-trixie) || latest='' ;;
+      *)    latest=$(latest_version "$comp") || latest='' ;;
     esac
     if [[ -z ${latest:-} ]]; then
       report "$comp" 'unknown' 'could not reach upstream'
@@ -202,13 +256,15 @@ cmd_check() {
     case $comp in
       bitcoin|litecoin|monero)
         if sha=$(verify_manifest "$comp" "$latest"); then
-          local count expired
+          local count expired revoked
           count=$(<"$WORK/sigcount")
           expired=$(<"$WORK/expired")
+          revoked=$(<"$WORK/revoked")
           note="$pinned -> $latest  (${count} trusted sig"
           (( count == 1 )) || note+='s'
           note+=')'
           (( expired )) && note+='  [signing key EXPIRED]'
+          (( revoked )) && note+='  [a signing key is REVOKED and was not counted]'
           report "$comp" 'UPDATE' "$note"
           printf '  %-9s %-12s sha256:%s\n' '' '' "$sha"
         else
@@ -232,6 +288,8 @@ repin_chain() {
   # assigning any of them, so ${chain^^} here would read as unset under set -u.
   local upper=${chain^^}
   local file="$BUNDLE_DIR/containers/${chain}.Containerfile"
+  validate "the version of $chain" "$version" "$VERSION_RE" || return 1
+  validate "the checksum of $chain" "$sha" "$SHA256_RE" || return 1
   sed -i -e "s|^ARG ${upper}_VERSION=.*|ARG ${upper}_VERSION=${version}|" \
          -e "s|^ARG ${upper}_SHA256=.*|ARG ${upper}_SHA256=${sha}|" "$file"
   printf '  re-pinned %s to %s\n' "$chain" "$version"
@@ -241,6 +299,7 @@ repin_digest() {
   local var=$1 repo=$2 tag=$3 digest
   digest=$(latest_digest "$repo" "$tag")
   [[ -n $digest ]] || { printf 'Could not resolve %s:%s\n' "$repo" "$tag" >&2; return 1; }
+  validate "the digest of $repo:$tag" "$digest" "$DIGEST_RE" || return 1
   sed -i "s|^readonly ${var}=.*|readonly ${var}='docker.io/${repo}@${digest}'|" "$BUNDLE_DIR/lib.sh"
   printf '  re-pinned %s to %s\n' "$var" "$digest"
 }
@@ -258,6 +317,7 @@ cmd_apply() {
         ;;
       arti)
         latest=$(latest_version arti)
+        validate 'the version of arti' "$latest" "$VERSION_RE" || return 1
         [[ $latest == "$ARTI_VERSION" ]] && { printf '  arti already current\n'; continue; }
         sed -i "s|^ARG ARTI_VERSION=.*|ARG ARTI_VERSION=${latest}|" \
           "$BUNDLE_DIR/containers/arti.Containerfile"
@@ -271,6 +331,10 @@ cmd_apply() {
   # Re-exec so lib.sh re-reads the pins just rewritten; otherwise the rebuild
   # would tag images with the versions this process started with.
   printf '\nRebuilding from the new pins...\n'
+  # exec replaces this process, so the EXIT trap never fires; the re-executed
+  # copy makes a $WORK of its own.
+  rm -rf -- "$WORK"
+  WORK=''
   exec "$BUNDLE_DIR/update.sh" --redeploy "$@"
 }
 
@@ -334,6 +398,7 @@ cmd_redeploy() {
         ;;
     esac
   done
+  prune_old_images
   printf 'Update complete.  Deployed images:\n'
   sed 's/^/  /' "$PREFIX/images.env"
 }

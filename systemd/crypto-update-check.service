@@ -13,3 +13,34 @@ ExecStart=@@BUNDLE_DIR@@/update.sh --check
 # not be reached, or that a new release failed its signature threshold and was
 # reported BLOCKED.  Both are things worth seeing in `systemctl --failed`.
 Nice=10
+# Six upstream fetches at 60s each, plus key imports, with room to spare.  A
+# Type=oneshot unit has no start timeout of its own by default.
+TimeoutStartSec=30min
+
+# This unit parses remote input as root once a day.  --check only reads the
+# network and writes the verification keyring, so it can be confined tightly.
+# The sandbox applies to the timer only: --apply and --redeploy are run by hand
+# and rebuild images, which ProtectSystem=strict would refuse outright.
+# MemoryDenyWriteExecute and SystemCallFilter are deliberately left off -- they
+# are the two most likely to misfire on a future curl or gpg, and a sandbox
+# that silently breaks the daily check is worse than a slightly looser one.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# read-only rather than yes: the unit runs update.sh from wherever the bundle
+# was copied, and that is sometimes a home directory.
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/etc/crypto-daemons/keys
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+# AF_NETLINK is not optional: glibc uses it for source-address selection, so
+# curl fails to resolve anything without it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native

@@ -14,6 +14,12 @@ Volume=/etc/crypto-daemons/bitcoin-rpcauth.conf:/etc/bitcoin/rpcauth.conf:ro
 # re-execs through gosu/fixuid, which needs capabilities this unit drops; the
 # Bitcoin/Litecoin ones also append -datadir and would override datadir=/data.
 PodmanArgs=--entrypoint bitcoind
+# Quadlet generates `ExecStop=podman rm -v -f -i` with no -t, so the SIGTERM to
+# SIGKILL grace is the container's own stop timeout -- containers.conf default
+# 10s -- and not TimeoutStopSec below, which only bounds how long systemd waits
+# for that command to return. Ten seconds is not enough to flush a warm cache,
+# so set it here, 60s under the unit timeout so podman is not killed mid-stop.
+PodmanArgs=--stop-timeout=540
 Exec=-conf=/etc/bitcoin/bitcoin.conf
 User=0
 NoNewPrivileges=true
