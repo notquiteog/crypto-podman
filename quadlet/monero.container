@@ -1,7 +1,8 @@
 [Unit]
 Description=Monero daemon (Tor-only, restricted RPC via Arti onion service)
 After=arti.service time-sync.target
-Requires=arti.service
+# Wants, not Requires: see the note in litecoin.container.
+Wants=arti.service
 
 [Container]
 Image=@@MONERO_IMAGE@@

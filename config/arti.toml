@@ -19,16 +19,16 @@ state_dir = "/var/lib/arti/state"
 # Each service has a separate, persistent onion identity.  Only the designated
 # RPC port is forwarded; all other virtual ports destroy the circuit.
 #
-# Bitcoin, Monero and the Monero wallet RPC live on the internal network, which
-# has no route to the internet; Litecoin is on the egress network because it
-# cannot bootstrap over Tor.  Arti is on both, which is why it can reach all
-# four.  See quadlet/crypto.network and quadlet/crypto-egress.network.
+# All four services live on the internal network, which has no route to the
+# internet: every daemon reaches the outside only through this proxy.  Arti is
+# additionally on the egress network, alone, because it is the one process here
+# that must talk to the Tor network directly.  See quadlet/crypto.network.
 [onion_services."bitcoin-rpc"]
 proxy_ports = [["8332", "10.89.0.11:8332"], ["*", "destroy"]]
 # restricted_discovery.enabled = true
 
 [onion_services."litecoin-rpc"]
-proxy_ports = [["9332", "10.89.1.12:9332"], ["*", "destroy"]]
+proxy_ports = [["9332", "10.89.0.12:9332"], ["*", "destroy"]]
 # restricted_discovery.enabled = true
 
 [onion_services."monero-rpc"]

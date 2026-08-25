@@ -1,12 +1,16 @@
 [Unit]
-Description=Litecoin Core (clearnet P2P, RPC via Arti onion service)
+Description=Litecoin Core (all traffic via Arti SOCKS, RPC via onion service)
 After=arti.service time-sync.target
-Requires=arti.service
+# Wants, not Requires: the Tor-only guarantee comes from crypto.network having
+# no route out, so this daemon fails closed whether or not Arti is up.  Requires
+# would add no safety and would drag this daemon through every Arti restart --
+# measured: restarting a required unit restarts its dependents.
+Wants=arti.service
 
 [Container]
 Image=@@LITECOIN_IMAGE@@
 ContainerName=litecoin
-Network=crypto-egress.network:ip=10.89.1.12
+Network=crypto.network:ip=10.89.0.12
 Volume=/srv/crypto-daemons/litecoin:/data
 Volume=/etc/crypto-daemons/litecoin.conf:/etc/litecoin/litecoin.conf:ro
 Volume=/etc/crypto-daemons/litecoin-rpcauth.conf:/etc/litecoin/rpcauth.conf:ro

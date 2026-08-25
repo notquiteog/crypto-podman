@@ -1,7 +1,8 @@
 [Network]
 # Internal: no gateway route out, so the daemons on this network physically
-# cannot reach the clearnet.  Bitcoin's and Monero's Tor-only posture is then a
-# property of the network rather than a promise made by their config files.
+# cannot reach the clearnet.  All three chains live here, so their Tor-only
+# posture is a property of the network rather than a promise made by their
+# config files -- a bad proxy line fails closed instead of leaking.
 NetworkName=crypto
 Subnet=10.89.0.0/24
 Gateway=10.89.0.1

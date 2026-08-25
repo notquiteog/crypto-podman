@@ -4,25 +4,41 @@ This bundle deploys three full nodes, encrypted default wallets, and
 authenticated v3 onion-service RPC endpoints. No TCP port is published on the
 Debian host. Podman Quadlet keeps the five containers under systemd.
 
-Bitcoin and Monero reach the network **only over Tor**, and that is enforced by
+All three chains reach the network **only through Tor**, and that is enforced by
 the container network rather than by their own config files. There are two
 Podman networks:
 
 | Network | Members | Route to the internet |
 |---|---|---|
-| `crypto` | Arti, Bitcoin, Monero, Monero wallet RPC | none — `--internal --disable-dns` |
-| `crypto-egress` | Arti, Litecoin | yes |
+| `crypto` | Arti, Bitcoin, Litecoin, Monero, Monero wallet RPC | none — `--internal --disable-dns` |
+| `crypto-egress` | Arti | yes |
 
 Arti is on both, and is the only way anything on `crypto` reaches the outside
 world. A daemon there cannot open a clearnet connection or resolve a hostname
 even if its configuration told it to, so a bad `onlynet` line or a DNS seed
 lookup fails closed instead of leaking.
 
-Litecoin is the exception and peers over the clearnet: Tor exit relays reject
-port 9333, and the three onion addresses compiled into Litecoin Core are
-unreachable, so an onion-only Litecoin node never finds a peer and never syncs.
-It therefore lives on `crypto-egress` with Arti. All four RPC endpoints,
-Litecoin's included, are reachable only through an authenticated onion service.
+**Proxied, not onion-only.** Every daemon sends all outbound traffic and every
+DNS-seed lookup through Arti's SOCKS proxy, so nothing leaves this host outside
+Tor. None of them sets `onlynet=onion`, so they reach clearnet peers as well as
+onion ones, through Tor exit relays. That is a deliberate tradeoff: it gives a
+far larger and healthier peer set than onion-only, at the cost of exit relays
+being able to observe P2P traffic, which is unencrypted on Bitcoin's and
+Litecoin's v1 transports. What an exit cannot see is this host's own address.
+
+Litecoin is the weakest case, and the difference is measurable. Port 9333 is not
+in Tor's reduced exit policy — 8333 is — so most exits refuse it. Eleven minutes
+after a cold start on the test host, Bitcoin held 10 connections while Litecoin
+held 2, with its log full of `Socks5() connect to <ip>:9333 failed: general
+failure` as exit after exit declined the port. It still syncs: both chains were
+pulling headers (Bitcoin past 650k, Litecoin past 1.5M) and Monero was adding
+blocks. Expect Litecoin to find peers slowly and to run on a thin connection
+count. If that is not good enough for you, put Litecoin back on
+`crypto-egress.network` and drop its `proxy=` line — that trades its Tor-only
+guarantee for clearnet peering, which is what this bundle used to do.
+
+All four RPC endpoints are reachable only through an authenticated onion
+service.
 
 **Upgrading an existing install:** `podman network create --ignore` leaves an
 already-existing network exactly as it was, so a host set up before this change
@@ -221,7 +237,13 @@ manifest and verifies its signatures before showing you the checksum:
   monero    current      0.18.5.1
   arti      current      2.5.1
   base      UPDATE       sha256:3a39a05… -> sha256:9c1e77b…
+  disk      ok           412 GiB free on /srv/crypto-daemons
 ```
+
+The disk line is there because free space is checked once at install and the
+failure it guards against — a full disk during sync, which is what can damage
+Monero's database — arrives months later. Below 25 GiB it reports `LOW` and
+exits non-zero.
 
 A release whose signature does not meet the threshold is reported `BLOCKED` and
 its checksum is never printed, so an unverified hash cannot be copied into a pin
@@ -403,11 +425,11 @@ Enforced:
   `arti.toml` keeps its old `socks_listen`; a re-run prints the diff to apply.
 * No port is published to the host. Every listener exists only inside the
   private Podman networks; the only way in is an onion service.
-* Bitcoin, Monero and the Monero wallet RPC have no route to the internet at
-  all. `crypto.network` is created `--internal --disable-dns`, so their
-  Tor-only posture survives a bad config rather than depending on one. Only
-  Arti (which needs Tor) and Litecoin (which cannot use it) are on
-  `crypto-egress.network`.
+* No daemon has a route to the internet at all. `crypto.network` is created
+  `--internal --disable-dns`, so the Tor-only posture survives a bad config
+  rather than depending on one — a wrong `proxy=` line fails closed instead of
+  leaking. Arti alone is on `crypto-egress.network`, because it is the one
+  process here that must reach the Tor network directly.
 * Bitcoin and Litecoin accept RPC only from Arti's address on their bridge,
   not from the whole subnet. Core always permits loopback in addition, which is
   what each container's own health check uses.
@@ -421,7 +443,9 @@ Enforced:
   images. See the provenance table above.
 * Secrets are mode 0600 in a 0700 directory, and both the wallet directories
   and the chain data directories are 0700.
-* Bitcoin's peers are onion-only; verify with `getpeerinfo`.
+* Every peer connection is made through Arti. Verify with `getpeerinfo`: each
+  peer's `addr` is reached over SOCKS, and no connection originates from this
+  host's own address.
 
 Not enforced, and worth understanding before funding anything:
 
@@ -459,11 +483,13 @@ Not enforced, and worth understanding before funding anything:
   User-Agent rather than one naming this bundle, but the pattern of endpoints is
   itself distinctive. Disable the timer and
   run `--check` from elsewhere if that pattern matters to you.
-* **Litecoin's provenance is weaker** than the other two (single signature,
-  expired key), and its P2P traffic is not routed over Tor. Its DNS seed
-  lookups leave the host in the clear too, through the egress network's DNS;
-  `dnsseed=0` narrows that to the fixed seeds compiled in, at some cost to
-  bootstrap reliability. Its node is the
+* **Peers are not restricted to onion.** Traffic is proxied, not onion-only, so
+  Tor exit relays carry the clearnet portion of it and can read the unencrypted
+  v1 P2P protocol. Add `onlynet=onion` to a chain's config if you would rather
+  have a smaller peer set than an observable one; Bitcoin and Monero sustain
+  that well, Litecoin does not.
+* **Litecoin's provenance is weaker** than the other two — a single signature
+  from an expired key. Its node remains the least trustworthy component here. Its node is the
   least trustworthy component in this bundle.
 
 ## Restricted discovery
@@ -524,9 +550,8 @@ and keep a way in — an unconverted service, or console access — while you do
 * Arti's onion-service implementation is still developing.  Keep its version
   pinned and test an upgrade against a copy of this configuration before
   changing production keys.
-* Bitcoin and Monero are configured for Tor-only outbound peers; Litecoin peers
-  over the clearnet for the reason given above.  None of them accept inbound
-  P2P connections.  RPC remains unauthenticated at the onion layer
+* All three chains proxy every outbound connection through Arti and none of
+  them restricts peers to onion.  None accepts inbound P2P connections.  RPC remains unauthenticated at the onion layer
   but is protected by daemon authentication; treat an onion address as private
   and rotate credentials if it is shared unexpectedly.
 * Bitcoin and Litecoin wallets are encrypted and start locked. A send requires
@@ -550,6 +575,11 @@ and keep a way in — an unconverted service, or console access — while you do
   bounds how long systemd waits for that command. Without it both Core daemons
   are killed mid-flush on every restart and reboot and replay blocks on the way
   back up. If you add a daemon here, give it the same treatment.
+* The three chain units carry `Wants=arti.service`, not `Requires=`. The
+  Tor-only guarantee comes from `crypto.network` having no route out, so a
+  daemon fails closed whether or not Arti is running; `Requires=` would add no
+  safety while dragging all three chains through every Arti restart. Measured:
+  restarting a unit restarts everything that `Requires=` it.
 * **Arti is always SIGKILLed on stop.** It does not exit on SIGTERM in this
   configuration, so podman falls back to a kill after its 10-second grace and
   the container reports 137. Raising the stop timeout to 30 or 60 seconds, and

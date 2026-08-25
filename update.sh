@@ -280,6 +280,22 @@ cmd_check() {
     esac
   done
   printf -- '---------------------------------------------------------------\n'
+  # Free space is checked once at install and then never again, but the failure
+  # it guards against -- a full disk during sync, which is what can damage
+  # Monero's database -- arrives months later.  This runs daily and is already
+  # somewhere an operator looks, so report it here.
+  local avail
+  avail=$(df -BG --output=avail "$DATA_DIR" 2>/dev/null | tail -1 | tr -dc '0-9') || avail=''
+  if [[ -z $avail ]]; then
+    report 'disk' 'unknown' "could not read free space on $DATA_DIR"
+    rc=1
+  elif (( avail < 25 )); then
+    report 'disk' 'LOW' "${avail} GiB free on $DATA_DIR -- a full disk can damage Monero's LMDB"
+    rc=1
+  else
+    report 'disk' 'ok' "${avail} GiB free on $DATA_DIR"
+  fi
+  printf -- '---------------------------------------------------------------\n'
   printf 'Apply with: sudo ./update.sh --apply <component>\n\n'
   return $rc
 }
