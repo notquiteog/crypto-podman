@@ -26,11 +26,17 @@ Options:
   --print-recovery   Reprint wallet recovery material and exit.
   --shred-recovery   Destroy the server-side copies of the spend keys, once
                      they are backed up offline.  Irreversible.
-  --add-rpc-client <service> <name>
+  --add-rpc-client <service> <name> [--public-key <key>]
                      Authorize one client for restricted discovery on an onion
-                     service, and print its private key.  Services are
-                     bitcoin-rpc, litecoin-rpc, monero-rpc, monero-wallet-rpc.
-                     See the restricted-discovery notes in config/arti.toml.
+                     service.  Services are bitcoin-rpc, litecoin-rpc,
+                     monero-rpc, monero-wallet-rpc.  Without --public-key a
+                     keypair is made here and its private half printed once.
+                     With it, the client's own public key is recorded instead
+                     -- the line an Arti client such as CryptoStore's prints,
+                     descriptor:x25519:<52 base32 characters> -- and nothing
+                     secret is made or shown.  If restricted discovery is
+                     already on for that service, Arti is restarted so it
+                     reads the key.  See config/arti.toml.
   -h, --help         Show this message and exit.
 
 Environment:
@@ -46,6 +52,15 @@ Environment:
   INSTALL_PODMAN_DESKTOP   yes/no; skips the interactive prompt.
   PODMAN_DESKTOP_USER      Desktop login to install Podman Desktop for,
                            required when that is enabled and you are root.
+  UPDATE_CHECK_ROUTE       tor or direct, for the daily update check.  tor
+                           (the default on a first install) sends every
+                           request through Arti; direct sends them from this
+                           host's own address.  Unset on a re-run keeps what
+                           the host already has.
+  RESTART_ARTI             yes/no, for --add-rpc-client.  Default yes: when
+                           restricted discovery is on for the service, restart
+                           Arti so the new key takes effect.  no leaves that
+                           to your next restart of Arti.
 
 The daemons themselves are always built here from upstream signed releases
 with checksums pinned in containers/*.Containerfile; no daemon image is
@@ -478,14 +493,137 @@ WARN
   echo 'Done.  setup.sh --print-recovery will now report the material as unavailable.'
 }
 
+client_public_key() {
+  # Prints the one line to record for a client that brings its own key, in the
+  # exact form the generate path below writes, or refuses.  Arti reads every
+  # *.auth file in the directory at start and skips one it cannot parse with
+  # only a warning in its log -- so a mistyped key here would leave the client
+  # locked out while this command reported success.  Checked here instead.
+  local given=$1 key bytes
+  key=${given//[[:space:]]/}
+  # The C-tor CLIENT file format, <onion>:descriptor:x25519:<key>, carries the
+  # client's PRIVATE key.  Its shape is unmistakable, and a private key copied
+  # onto the server is exactly what this path exists to avoid.
+  if [[ ${key,,} =~ ^[a-z2-7]{56}(\.onion)?:descriptor:x25519: ]]; then
+    echo 'That is a client PRIVATE key line (<onion address>:descriptor:x25519:...),' >&2
+    echo 'as kept in a C-tor ClientOnionAuthDir.  It must never be copied to this server.' >&2
+    echo "Give the client's PUBLIC key instead: the line \`arti hsc key get\` prints." >&2
+    echo 'Nothing was changed.' >&2
+    exit 64
+  fi
+  if [[ ${key,,} == descriptor:x25519:* ]]; then
+    key=${key:18}
+  fi
+  # Base32 is case-insensitive; Arti accepts either, and one case on disk keeps
+  # the duplicate check below honest.
+  key=${key^^}
+  # 32 bytes is 52 base32 characters, and the last one carries a single bit of
+  # key and four of padding, which a strict decoder requires to be zero -- so
+  # it can only be A or Q.
+  bytes=0
+  if [[ $key =~ ^[A-Z2-7]{51}[AQ]$ ]]; then
+    bytes=$(printf '%s====' "$key" | base32 -d 2>/dev/null | wc -c) || bytes=0
+  fi
+  if (( bytes != 32 )) || [[ $key =~ ^A+$ ]]; then
+    echo 'That is not an x25519 public key.  Expected descriptor:x25519: followed by' >&2
+    printf '52 base32 characters (A-Z, 2-7), as \140arti hsc key get\140 prints it; got %d characters\n' \
+      "${#key}" >&2
+    echo 'after the prefix.  Nothing was changed.' >&2
+    exit 64
+  fi
+  printf 'descriptor:x25519:%s\n' "$key"
+}
+
+restricted_discovery_on() {
+  # True when the INSTALLED arti.toml turns restricted discovery on for this
+  # service, in either of the two spellings TOML allows.  Comments are dropped
+  # first: the shipped file carries every one of these lines commented out.
+  local service=$1
+  [[ -r $PREFIX/arti.toml ]] || return 1
+  awk -v s="$service" '
+    { line = $0; sub(/#.*/, "", line); gsub(/[[:space:]]/, "", line) }
+    line ~ /^\[/ { hdr = line; next }
+    hdr == "[onion_services.\"" s "\"]" && line == "restricted_discovery.enabled=true" { on = 1 }
+    hdr == "[onion_services.\"" s "\".restricted_discovery]" && line == "enabled=true" { on = 1 }
+    END { exit !on }' "$PREFIX/arti.toml"
+}
+
+apply_client_key() {
+  # Arti reads restricted-discovery keys when it starts.  Measured against
+  # Arti 2.8.0 with no network: after SIGHUP it logs "Successfully reloaded
+  # configuration" but showed no sign of rereading the key directory -- a
+  # malformed key file added before the signal drew no warning, the same file
+  # present at start did -- and watch_configuration behaved the same.  A
+  # reload that may not apply is the worst kind of success message here, so
+  # this restarts instead, which is known to.
+  local service=$1 file=$2 since log rejected=''
+  if ! restricted_discovery_on "$service"; then
+    cat <<OFF
+
+Restricted discovery is not on for $service yet, so Arti does not read this
+key until it is.  Uncomment this service's restricted_discovery.enabled line
+and its key_dirs block in $PREFIX/arti.toml, then: sudo systemctl restart arti
+Confirm you can still reach the service afterwards, from a client holding this
+key, before doing the same to the others.
+OFF
+    return 0
+  fi
+  if [[ ${RESTART_ARTI:-yes} == no ]]; then
+    cat <<LATER
+
+Restricted discovery is on for $service, and RESTART_ARTI=no: Arti reads this
+key the next time it starts.  Until then the client cannot reach the service.
+When ready: sudo systemctl restart arti
+LATER
+    return 0
+  fi
+  echo
+  echo 'Restricted discovery is on for this service, so restarting Arti to read the'
+  echo 'key.  All four onion services are unreachable for a few minutes while they'
+  echo 'republish; the chains keep running and reconnect through it.'
+  since=$(date +%s)
+  systemctl restart arti.service
+  wait_for_listener crypto-arti arti "$ARTI_SOCKS_HOST" "$ARTI_SOCKS_PORT" 5
+  # Arti names a key file in its log only when it could not use it.  The line
+  # comes before it starts listening, but reaches the journal through conmon,
+  # so give it a moment rather than reading the journal once.
+  for _ in 1 2 3; do
+    sleep 2
+    if ! log=$(journalctl -u arti.service --since "@$since" -o cat 2>/dev/null); then
+      echo "Arti is back, but its log could not be read to confirm it took the key:" >&2
+      echo "look for a line naming $file in: journalctl -u arti -n 50" >&2
+      return 0
+    fi
+    rejected=$(grep -F -- "${file#"$DATA_DIR"/arti/}" <<<"$log" | tail -n 1) || rejected=''
+    [[ -z $rejected ]] || break
+  done
+  if [[ -n $rejected ]]; then
+    printf 'Arti did not accept %s:\n  %s\n' "$file" "$rejected" >&2
+    echo 'The file is left in place so you can see it; remove it and add the key again.' >&2
+    exit 1
+  fi
+  echo 'Arti is back and did not reject the key.'
+}
+
 add_rpc_client() {
-  # Generates one x25519 keypair for Arti's restricted discovery: the public
-  # half is authorized here, the private half is printed once for the client.
-  # This only takes effect once the service's restricted_discovery block is
-  # uncommented in arti.toml -- see the notes there, and rebuild Arti first.
+  # Authorizes one client for Arti's restricted discovery on one service.
+  # Either generates an x25519 keypair (the public half is recorded here, the
+  # private half printed once for the client), or, with --public-key, records
+  # a public key the client made itself -- the only way an Arti client can be
+  # authorized, since Arti cannot take a pasted private key.
   # Refusals exit rather than return: each message is complete on its own, and
   # a return would also have the error trap report a "stopped" run.
-  local service=${1:-} name=${2:-} dir tmp pub priv
+  local service=${1:-} name=${2:-} given='' have_key=0 dir file line tmp pub priv held
+  shift 2 2>/dev/null || shift $#
+  while (( $# )); do
+    case $1 in
+      --public-key)
+        (( $# >= 2 )) || { echo '--public-key needs the key after it.' >&2; exit 64; }
+        given=$2; have_key=1; shift 2 ;;
+      --public-key=*) given=${1#--public-key=}; have_key=1; shift ;;
+      *) printf 'Unexpected argument after the client name: %s\n' "$1" >&2; exit 64 ;;
+    esac
+  done
   case $service in
     bitcoin-rpc|litecoin-rpc|monero-rpc|monero-wallet-rpc) ;;
     *)
@@ -498,12 +636,45 @@ add_rpc_client() {
     echo 'Client name must be alphanumeric, with - and _ allowed after the first character.' >&2
     exit 64
   fi
+  case ${RESTART_ARTI:-yes} in
+    yes|no) ;;
+    *) printf 'RESTART_ARTI must be yes or no; got %q.  Nothing was changed.\n' "$RESTART_ARTI" >&2; exit 64 ;;
+  esac
+  if (( have_key )); then
+    # || exit: the refusal is already printed, and errexit here would add the
+    # error trap's "stopped" banner under it.
+    line=$(client_public_key "$given") || exit 64
+  fi
   dir="$DATA_DIR/arti/authorized_clients/$service"
+  file="$dir/$name.auth"
   install -d -m 0700 "$dir"
-  if [[ -e $dir/$name.auth ]]; then
+  if [[ -e $file ]]; then
     echo "A client called $name is already authorized for $service." >&2
-    echo "Remove $dir/$name.auth first if you mean to reissue its key." >&2
+    echo "Remove $file first if you mean to reissue its key." >&2
     exit 1
+  fi
+  if (( have_key )); then
+    # Two names for one key would make removing either one look like revoking
+    # the client when it is not.
+    held=$(grep -rlxF -- "$line" "$dir" 2>/dev/null | head -n 1) || held=''
+    if [[ -n $held ]]; then
+      echo "That key is already authorized for $service, in $held." >&2
+      echo 'Nothing was changed.' >&2
+      exit 1
+    fi
+    # Written beside the target and renamed, so Arti -- which reads every
+    # *.auth here -- can never see half a key.
+    printf '%s\n' "$line" >"$dir/.$name.auth.new"
+    chmod 0600 "$dir/.$name.auth.new"
+    mv -f -- "$dir/.$name.auth.new" "$file"
+    cat <<OWNKEY
+
+Authorized '$name' for $service with the public key it brought.
+  Recorded in: $file
+Nothing secret was made or shown: the private half stays with the client.
+OWNKEY
+    apply_client_key "$service" "$file"
+    return 0
   fi
   tmp=$(mktemp -d)
   # EXIT, not RETURN: key.pem below is the client's PRIVATE key, and a RETURN
@@ -516,12 +687,13 @@ add_rpc_client() {
   # base32 client-auth format wants.
   pub=$(openssl pkey -in "$tmp/key.pem" -pubout -outform DER | tail -c 32 | base32 | tr -d '=\n')
   priv=$(openssl pkey -in "$tmp/key.pem" -outform DER | tail -c 32 | base32 | tr -d '=\n')
-  printf 'descriptor:x25519:%s\n' "$pub" >"$dir/$name.auth"
-  chmod 0600 "$dir/$name.auth"
+  printf 'descriptor:x25519:%s\n' "$pub" >"$dir/.$name.auth.new"
+  chmod 0600 "$dir/.$name.auth.new"
+  mv -f -- "$dir/.$name.auth.new" "$file"
   cat <<CLIENT
 
 Authorized '$name' for $service.
-  Public key recorded in: $dir/$name.auth
+  Public key recorded in: $file
 
 Give the client this private key.  It is printed once and is not stored here:
 
@@ -529,12 +701,9 @@ Give the client this private key.  It is printed once and is not stored here:
 
 For a C-tor client, that line goes in ClientOnionAuthDir as
 <onion-address-without-.onion>:descriptor:x25519:$priv
-
-Restricted discovery is not active until you uncomment this service's
-restricted_discovery block in /etc/crypto-daemons/arti.toml and restart Arti.
-Confirm you can still reach the service afterwards, from a client holding this
-key, before doing the same to the others.
+An Arti client cannot take it; give one of those --public-key instead.
 CLIENT
+  apply_client_key "$service" "$file"
 }
 
 onion_address() {
@@ -628,6 +797,65 @@ or curl --socks5-hostname): .onion has no DNS.
   Wallet password  : ${MONERO_WALLET_PASSWORD}
   Receive address  : ${MONERO_DEFAULT_ADDRESS:-not yet generated}
 
+---- For CryptoStore -------------------------------------------
+Where each value goes in the store: Admin > Nodes, the coin's card,
+then its Connection row.  No password is repeated here; each line
+names the one above to copy.  Every address is an onion, so the
+store's own Tor proxy (Settings > Tor proxy) has to work first.
+Offering a coin to buyers is the card's "Accept ... at checkout"
+switch, which nothing here sets.
+
+Bitcoin card > Connection
+  Node enabled                 : on
+  Address / IP                 : ${btc_onion}
+  Port                         : 8332
+  RPC username                 : ${BITCOIN_RPC_USER}
+  RPC password                 : Password, under Bitcoin Core above
+  Wallet name                  : default   (not the store's own default,
+                                 "wallet": this node has no such wallet)
+  Reach this node through Tor  : on        (forced on for an onion)
+  The card's Unlock asks for the Wallet passphrase above when a send
+  needs it; it is typed then, never kept as a setting.
+  In the store's .env instead: BTC_RPC_ENABLED=true BTC_RPC_HOST
+  BTC_RPC_PORT=8332 BTC_RPC_USER BTC_RPC_PASS BTC_RPC_WALLET=default
+
+Litecoin card > Connection
+  Node enabled                 : on
+  Address / IP                 : ${ltc_onion}
+  Port                         : 9332
+  RPC username                 : ${LITECOIN_RPC_USER}
+  RPC password                 : Password, under Litecoin Core above
+  Wallet name                  : default   (not the store's own default,
+                                 "wallet": this node has no such wallet)
+  Reach this node through Tor  : on        (forced on for an onion)
+  Unlock asks for the Litecoin Wallet passphrase above, as for Bitcoin.
+  In the store's .env instead: LTC_RPC_ENABLED=true LTC_RPC_HOST
+  LTC_RPC_PORT=9332 LTC_RPC_USER LTC_RPC_PASS LTC_RPC_WALLET=default
+
+Monero card > Connection  (the wallet RPC, which takes the payments)
+  Node enabled                 : on
+  Address / IP                 : ${wallet_onion}
+  Port                         : 18088     (the store suggests 18083)
+  RPC username                 : ${MONERO_WALLET_RPC_USER}
+  RPC password                 : Password, under Monero wallet RPC above
+  Wallet name                  : default
+  Wallet file password         : leave blank  (this wallet RPC opens its
+                                 one file at start and cannot reopen it)
+  Reach this node through Tor  : on        (forced on for an onion)
+ Same card, Monero daemon (optional; shows real chain sync)
+  Daemon address               : ${xmr_onion}
+  Port                         : 18089
+  Daemon username              : ${MONERO_RPC_USER}
+  Daemon password              : Password, under Monero daemon above
+  Reach the daemon through Tor : on
+  In the store's .env instead: XMR_RPC_ENABLED=true XMR_RPC_HOST
+  XMR_RPC_PORT=18088 XMR_RPC_USER XMR_RPC_PASS XMR_DAEMON_HOST
+  XMR_DAEMON_PORT=18089 XMR_DAEMON_USER XMR_DAEMON_PASS
+
+If restricted discovery is on for a service (README), authorize the
+store's own Arti for it first, with the public key that Arti prints:
+  sudo $0 --add-rpc-client <service> store --public-key '<key>'
+
 ---- Notes for whoever writes the client -----------------------
 * Monero uses HTTP **digest** auth.  Sending Basic auth with correct
   credentials still returns 401, which looks like a wrong password.
@@ -683,6 +911,7 @@ install_configs() {
 
 main() {
   require_root
+  check_update_route_choice
   # Only the two build base images come from a registry, and both must still be
   # immutable: they are the root of trust for every binary built below.
   resolve_base_images
@@ -792,7 +1021,7 @@ case ${1:-} in
   --add-rpc-client)
     require_root
     shift
-    add_rpc_client "${1:-}" "${2:-}"
+    add_rpc_client "$@"
     exit 0
     ;;
   '')

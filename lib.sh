@@ -31,6 +31,16 @@ readonly SERVICES=(arti.service bitcoin.service litecoin.service monero.service)
 # Every image repository this bundle builds into.  Superseded images are only
 # ever looked for here, so nothing else on the host can be touched.
 readonly IMAGE_REPOS=(localhost/crypto-arti localhost/crypto-bitcoin localhost/crypto-litecoin localhost/crypto-monero)
+# Arti's SOCKS listener.  The same address is written in arti.container
+# (Network=crypto.network:ip= and HealthCmd), in arti.toml (socks_listen) and
+# in systemd/crypto-update-check.service (IPAddressAllow=); move all of them
+# together.  The host reaches it through the internal bridge's own gateway
+# address, so nothing is published for update.sh to use it.
+readonly ARTI_SOCKS_HOST=10.89.0.10
+readonly ARTI_SOCKS_PORT=9150
+# Present only when setup.sh was run with UPDATE_CHECK_ROUTE=direct; see
+# install_update_timer.  update.sh reads the route back out of the unit.
+readonly UPDATE_ROUTE_DROPIN=/etc/systemd/system/crypto-update-check.service.d/route.conf
 
 on_error() {
   # Under set -e a failing step used to end the run with only the failing
@@ -237,6 +247,19 @@ install_quadlets() {
   fi
 }
 
+check_update_route_choice() {
+  # Called before anything is changed, so a typo stops the run up front
+  # rather than after an hour of image builds.
+  case ${UPDATE_CHECK_ROUTE:-} in
+    ''|tor|direct) ;;
+    *)
+      printf 'UPDATE_CHECK_ROUTE must be tor or direct; got %q.  Nothing was changed.\n' \
+        "$UPDATE_CHECK_ROUTE" >&2
+      exit 64
+      ;;
+  esac
+}
+
 install_update_timer() {
   # update.sh is run from wherever the bundle was copied, so the unit records
   # that path at install time.  Moving the bundle afterwards breaks the timer;
@@ -245,8 +268,43 @@ install_update_timer() {
     /etc/systemd/system/crypto-update-check.service
   install -m 0644 "$BUNDLE_DIR/systemd/crypto-update-check.timer" \
     /etc/systemd/system/crypto-update-check.timer
+  # The unit itself always says tor, and only lets the check talk to Arti's
+  # SOCKS address.  Going direct is a drop-in on top of it rather than a second
+  # copy of the unit, so `systemctl cat` shows the deviation where it lives.
+  # Unset keeps whatever this host already has, so a re-run that forgets the
+  # variable cannot quietly undo a deliberate choice in either direction.
+  case ${UPDATE_CHECK_ROUTE:-} in
+    direct)
+      install -d -m 0755 "${UPDATE_ROUTE_DROPIN%/*}"
+      cat >"$UPDATE_ROUTE_DROPIN" <<'DIRECT'
+# Written by crypto-daemons setup.sh, because it was run with
+# UPDATE_CHECK_ROUTE=direct: the daily update check fetches from this host's
+# own address instead of through Arti.  To go back through Tor, re-run setup.sh
+# with UPDATE_CHECK_ROUTE=tor, or delete this file and run
+# `systemctl daemon-reload`.
+[Service]
+Environment=UPDATE_CHECK_ROUTE=direct
+# The unit allows only Arti's SOCKS address; an empty value clears each list.
+IPAddressAllow=
+IPAddressDeny=
+DIRECT
+      chmod 0644 "$UPDATE_ROUTE_DROPIN"
+      ;;
+    tor)
+      # Only ever the file written above, recognised by its first line.
+      if [[ -e $UPDATE_ROUTE_DROPIN ]] &&
+         head -n 1 "$UPDATE_ROUTE_DROPIN" | grep -qF 'Written by crypto-daemons setup.sh'; then
+        rm -f -- "$UPDATE_ROUTE_DROPIN"
+      fi
+      ;;
+  esac
   systemctl daemon-reload
   systemctl enable --now crypto-update-check.timer
+  if [[ -e $UPDATE_ROUTE_DROPIN ]]; then
+    echo "The daily update check fetches from this host's own address (UPDATE_CHECK_ROUTE=direct, in $UPDATE_ROUTE_DROPIN)."
+  else
+    echo 'The daily update check fetches through Tor, via Arti.'
+  fi
 }
 
 migrate_internal_network() {
@@ -384,7 +442,7 @@ wait_for_services() {
   local comp
   for comp in "$@"; do
     case $comp in
-      arti)     wait_for_listener crypto-arti arti 10.89.0.10 9150 5 ;;
+      arti)     wait_for_listener crypto-arti arti "$ARTI_SOCKS_HOST" "$ARTI_SOCKS_PORT" 5 ;;
       bitcoin)  wait_for_core_rpc bitcoin bitcoin-cli ;;
       litecoin) wait_for_core_rpc litecoin litecoin-cli ;;
       monero)

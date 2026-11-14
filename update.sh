@@ -44,15 +44,157 @@ Components: ${COMPONENTS[*]}
   base                        Debian build/runtime image digest
   rust                        Rust image digest used to compile arti
 
+Environment:
+  UPDATE_CHECK_ROUTE     tor (default) or direct.  Every request --check and
+                         --apply make goes through Arti's SOCKS proxy at
+                         ${ARTI_SOCKS_HOST}:${ARTI_SOCKS_PORT}; if Arti cannot carry it, nothing is
+                         fetched.  direct fetches from this host's own address,
+                         as this script did before.  Unset, a run by hand
+                         follows the daily timer's setting (setup.sh sets it).
+                         Image builds still download over the clearnet.
+
 Never prints wallet recovery material or RPC credentials; use
 'setup.sh --print-details' for those.
 USAGE
 }
 
-# No custom User-Agent: this runs on the host over the clearnet once a day, and
-# a bundle-specific string would tag that traffic as this deployment.  curl's
-# default is generic and satisfies GitHub's requirement that one be sent.
-fetch() { curl -fsSL --max-time 60 "$@" </dev/null; }
+# How long a tor-routed run waits for Arti to be able to build a circuit.  The
+# timer fires right at the end of setup.sh, which is also when Arti has just
+# been restarted, and a cold Arti takes a few minutes to fetch a directory.
+readonly TOR_WAIT_SECONDS=600
+# Settled once per run by settle_route, before anything is fetched.
+UPDATE_ROUTE=''
+ROUTE_NONCE=''
+
+settle_route() {
+  # The environment wins; otherwise the route the timer's unit was given, so
+  # `sudo ./update.sh --apply` by hand takes the same road as the daily check
+  # on a host whose operator chose direct.  Default tor.  tail, because a
+  # drop-in's Environment= line comes after the unit's own and is the one
+  # systemd applies.
+  local route=${UPDATE_CHECK_ROUTE:-} unit_env=''
+  if [[ -z $route ]]; then
+    unit_env=$(systemctl show -p Environment --value crypto-update-check.service 2>/dev/null) || unit_env=''
+    route=$(grep -o 'UPDATE_CHECK_ROUTE=[^[:space:]]*' <<<"$unit_env" | tail -n 1) || route=''
+    route=${route#UPDATE_CHECK_ROUTE=}
+  fi
+  route=${route:-tor}
+  case $route in
+    tor|direct) ;;
+    *)
+      printf 'UPDATE_CHECK_ROUTE must be tor or direct; got %q.  Nothing was fetched.\n' "$route" >&2
+      exit 64
+      ;;
+  esac
+  UPDATE_ROUTE=$route
+  ROUTE_NONCE=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+}
+
+route_curl() {
+  # The only place this script calls curl, so that no request can leave by a
+  # road the operator did not choose.  It refuses outright when no route has
+  # been settled: a fetch added later that forgot to settle one must fail, not
+  # quietly go direct.
+  #
+  # Over Tor, the SOCKS username is the destination host plus a per-run nonce.
+  # Arti keeps streams with different credentials on different circuits, so
+  # GitHub, crates.io and the download sites each see a different exit and no
+  # one exit sees the whole pattern -- the same isolation Tor Browser gives
+  # each site.  A failed request is tried once more under a new username, so
+  # on a fresh circuit: an exit that refuses the port, or one whose shared
+  # address has used up GitHub's anonymous API allowance (a 403), costs a
+  # retry rather than an "unknown" row.  ROUTE_TRIES=1 turns that off.
+  #
+  # No custom User-Agent either way: a bundle-specific string would tag this
+  # traffic as this deployment.  curl's default is generic and satisfies
+  # GitHub's requirement that one be sent.
+  local url='' arg host n rc=0 tries=${ROUTE_TRIES:-2}
+  for arg; do
+    case $arg in http://*|https://*) url=$arg ;; esac
+  done
+  case $UPDATE_ROUTE in
+    direct)
+      curl --max-time 60 "$@" </dev/null
+      ;;
+    tor)
+      host=${url#*://}
+      host=${host%%/*}
+      for (( n = 1; n <= tries; n++ )); do
+        rc=0
+        curl --proxy "socks5h://${host:-none}-${ROUTE_NONCE}-${n}:x@${ARTI_SOCKS_HOST}:${ARTI_SOCKS_PORT}" \
+          --max-time 120 "$@" </dev/null || rc=$?
+        (( rc )) || return 0
+      done
+      return "$rc"
+      ;;
+    *)
+      printf 'Refusing to fetch %s: no route was settled for this run.\n' "${url:-a URL}" >&2
+      return 1
+      ;;
+  esac
+}
+
+fetch() { route_curl -fsSL "$@"; }
+
+arti_listening() {
+  timeout 5 bash -c "exec 3<>/dev/tcp/$ARTI_SOCKS_HOST/$ARTI_SOCKS_PORT" 2>/dev/null
+}
+
+tor_circuit() {
+  # Any HTTP answer at all proves that Arti built a circuit and an exit
+  # connected, which a listening SOCKS port does not: Arti accepts connections
+  # long before it is bootstrapped, and simply holds each request until it is.
+  # crates.io because it is asked anyway, so the probe adds no destination;
+  # its front page because it is not a rate-limited API.  No -f: a 403 or a
+  # 5xx from crates.io still proves the circuit.
+  ROUTE_TRIES=1 route_curl -sS -o /dev/null --head --max-time 60 https://crates.io/
+}
+
+route_ready() {
+  # Says which road this run's requests take, and for tor makes sure there is
+  # one before anything is fetched.  Never falls back to direct: a check that
+  # went to the clearnet whenever Arti was down would make the guarantee only
+  # as good as Arti's uptime, and the operator could not tell which days.
+  if [[ $UPDATE_ROUTE == direct ]]; then
+    echo "Fetching directly, from this host's own address (UPDATE_CHECK_ROUTE=direct)."
+    return 0
+  fi
+  local state err='' said=0 deadline=$(( SECONDS + TOR_WAIT_SECONDS ))
+  local -r again='The daily timer tries again tomorrow; to try now: sudo systemctl start crypto-update-check.service'
+  local -r instead="To fetch from this host's own address instead, set UPDATE_CHECK_ROUTE=direct (README, \"Applying security updates\")."
+  if ! arti_listening; then
+    state=$(systemctl is-active arti.service 2>/dev/null) || true
+    if [[ $state == active ]]; then
+      printf "Arti is running, but its SOCKS proxy at %s:%s does not answer from this host.\n" \
+        "$ARTI_SOCKS_HOST" "$ARTI_SOCKS_PORT" >&2
+      echo "The host reaches it through the crypto network's bridge: \`ip -br addr\` should" >&2
+      echo 'show 10.89.0.1 on one of the podman bridges.' >&2
+    else
+      printf 'Arti is not running (arti.service is %s), so there is no way through Tor.\n' \
+        "${state:-not installed}" >&2
+    fi
+    printf 'Nothing was fetched: this run goes through Tor and never falls back to the clearnet.\n%s\n%s\n' \
+      "$again" "$instead" >&2
+    return 1
+  fi
+  until err=$(tor_circuit 2>&1 >/dev/null); do
+    if (( SECONDS >= deadline )); then
+      printf 'Arti is listening but has not built a circuit in %d minutes%s.\n' \
+        "$(( TOR_WAIT_SECONDS / 60 ))" "${err:+ (${err##*$'\n'})}" >&2
+      echo 'Its own log says why: journalctl -u arti -n 50.  "No usable guards" there is the' >&2
+      echo 'case in the README under "After an Arti update".' >&2
+      printf 'Nothing was fetched: this run goes through Tor and never falls back to the clearnet.\n%s\n%s\n' \
+        "$again" "$instead" >&2
+      return 1
+    fi
+    if (( ! said )); then
+      printf 'Waiting for Arti to build a circuit (up to %d minutes)...\n' "$(( TOR_WAIT_SECONDS / 60 ))"
+      said=1
+    fi
+    sleep 30
+  done
+  printf 'Fetching through Tor, via Arti at %s:%s.\n' "$ARTI_SOCKS_HOST" "$ARTI_SOCKS_PORT"
+}
 # --yes because --batch otherwise refuses to overwrite an existing --output
 # file, which reads as a zero-signature verification on the second chain.
 gpgr()  { gpg --batch --yes --no-tty --homedir "$KEYRING_DIR" "$@"; }
@@ -263,10 +405,10 @@ latest_digest() {
   local repo=$1 tag=$2 token
   token=$(fetch "https://auth.docker.io/token?service=registry.docker.io&scope=repository:${repo}:pull" |
           jq -r .token)
-  curl -fsSI --max-time 60 -H "Authorization: Bearer $token" \
+  route_curl -fsSI -H "Authorization: Bearer $token" \
     -H 'Accept: application/vnd.oci.image.index.v1+json' \
     -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
-    "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" </dev/null |
+    "https://registry-1.docker.io/v2/${repo}/manifests/${tag}" |
     tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p'
 }
 
@@ -293,6 +435,14 @@ report() { printf '  %-9s %-12s %s\n' "$1" "$2" "$3"; }
 
 cmd_check() {
   local comp pinned latest sha note why pattern rc updates=0
+  settle_route
+  # 75 (EX_TEMPFAIL), apart from the 1 a finished check exits with when it has
+  # something to report: nothing was checked, and nothing is known to be wrong
+  # with any component -- only that there was no road to ask by.
+  if ! route_ready; then
+    CHECK_RC=75
+    return 0
+  fi
   # Non-fatal, for the same reason the per-component fetches below are: all the
   # key URLs share one host, and an outage there must not cost the whole report.
   # Chains whose keys are missing then report BLOCKED, with this line above.
@@ -536,6 +686,10 @@ cmd_apply() {
   RUST_GIVEN=${ARTI_RUST_IMAGE:+1}
   resolve_base_images
   check_base_drift "--apply $*" "$@"
+  # Applying asks the same upstreams the check does, so it takes the same road.
+  # The rebuild it hands over to downloads over the clearnet; see the README.
+  settle_route
+  route_ready || refuse_apply
   import_keys || refuse_apply
   for comp in "$@"; do
     case $comp in

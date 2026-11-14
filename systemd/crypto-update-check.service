@@ -13,16 +13,36 @@ Type=oneshot
 # status 203/EXEC while `sudo bash setup.sh` had worked fine.  Quoted so a
 # bundle path containing a space is still one argument.
 ExecStart=/bin/bash "@@BUNDLE_DIR@@/update.sh" --check
+# Through Arti, so this host's own address is never seen asking GitHub,
+# crates.io, Docker Hub and the three download sites the same questions every
+# day.  setup.sh run with UPDATE_CHECK_ROUTE=direct adds a drop-in that
+# overrides this line and the two IPAddress lines below.
+Environment=UPDATE_CHECK_ROUTE=tor
+# The kernel's half of that promise: this unit may open a socket to Arti's
+# SOCKS address and to nothing else, so a request that somehow skipped the
+# proxy fails instead of reaching the clearnet.  Keep the address in step with
+# ARTI_SOCKS_HOST in lib.sh.  Nothing here needs DNS -- the proxy resolves
+# every name at the exit -- which is why even loopback is left out.
+IPAddressDeny=any
+IPAddressAllow=10.89.0.10/32
 # A non-zero exit is meaningful rather than noise: it means a component could
 # not be reached, or that a new release failed its signature threshold and was
 # reported BLOCKED.  Both are things worth seeing in `systemctl --failed`.
+# 75 means nothing was checked at all, because Arti could not carry a request.
 Nice=10
-# Six upstream fetches at 60s each, plus key imports, with room to spare.  A
-# Type=oneshot unit has no start timeout of its own by default.
-TimeoutStartSec=30min
+# Up to ten minutes waiting for Arti to build a circuit, then about twenty
+# requests that take seconds each over Tor.  Each may run 120s and is tried
+# twice, so a run where nearly every one times out is ended here rather than
+# waited out; it is reported failed either way.  A Type=oneshot unit has no
+# start timeout of its own by default.
+TimeoutStartSec=60min
 
 # This unit parses remote input as root once a day.  --check only reads the
 # network and writes the verification keyring, so it can be confined tightly.
+# That is also why it talks to Arti's SOCKS port across the bridge instead of
+# running its requests in a helper container on the internal network: podman
+# run needs namespaces, cgroups, /proc/sys and write access to its storage,
+# which is every line below.
 # The sandbox applies to the timer only: --apply and --redeploy are run by hand
 # and rebuild images, which ProtectSystem=strict would refuse outright.
 # MemoryDenyWriteExecute and SystemCallFilter are deliberately left off -- they

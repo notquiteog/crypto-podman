@@ -127,9 +127,21 @@ Those downloads are the one part of the install that does **not** go through
 Tor. The image builds run on the host's own network: the two base images from
 Docker Hub, Debian packages from its mirrors, arti's crates from crates.io, and
 the release tarballs from bitcoincore.org, download.litecoin.org and
-downloads.getmonero.org. Only the daemons, once running, are confined to Tor.
-If this host's address must never be seen asking for those things, build the
-images somewhere else and load them here.
+downloads.getmonero.org. The daemons, once running, are confined to Tor, and so
+is the daily update check (see "Applying security updates"); a rebuild by
+`update.sh --apply` or `--redeploy` downloads over the clearnet exactly as the
+install does. If this host's address must never be seen asking for those
+things, build the images somewhere else and load them here.
+
+Builds are left on the clearnet on purpose. On a first install there is no Arti
+yet to route through, since Arti is one of the images being built. After that,
+routing a rebuild would need four separate proxy mechanisms to agree — podman's
+own pull of the base images, `apt-get`, `cargo` and `curl` inside the build
+containers — and the build containers moved onto the internal network so that
+one of them ignoring its proxy fails instead of leaking. Each of those fails in
+its own way, a rebuild is a by-hand step rather than a daily pattern, and none
+of it can be proven short of a full rebuild through a live Arti, so it is not
+done behind a switch that would only look like a guarantee.
 
 To build against your own reviewed bases instead of the shipped pins:
 
@@ -215,6 +227,14 @@ authentication scheme, the wallet names, the wallet passphrases, and the default
 receive addresses. The same text is saved to
 `/etc/crypto-daemons/secrets/connection-details.txt` (mode 0600).
 
+It ends with a **For CryptoStore** block: for each coin, the boxes on the
+store's Admin → Nodes page in the order the page shows them, what to type in
+each, and the store `.env` variable that does the same job. It names the
+wallet `default` — the store's own default is `wallet`, which these nodes do
+not have — and the Monero wallet RPC's port, 18088, where the store suggests
+18083. Passwords are not repeated in that block; each line names the one
+above it to copy.
+
 To print it again later without reinstalling:
 
 ```bash
@@ -244,6 +264,10 @@ maintenance release on an older branch, published after the pinned one, is
 reported `current` with a note, and `--apply` never moves a pin backwards.
 
 ```
+Fetching through Tor, via Arti at 10.89.0.10:9150.
+
+Component  Status       Detail
+---------------------------------------------------------------
   bitcoin   UPDATE       31.1 -> 31.2  (11 trusted sigs)
                          sha256:b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e
   litecoin  current      0.21.5.6
@@ -267,6 +291,62 @@ release and is updated after the release appears — and is not a failure.
 `unknown` means upstream could not be reached, with curl's reason in the row.
 `BLOCKED`, `unknown` and `LOW` make the command exit non-zero; `UPDATE` and
 `pending` do not.
+
+### Which road the requests take
+
+Every request `--check` and `--apply` make — GitHub, crates.io, Docker Hub,
+bitcoincore.org, getmonero.org, and the weekly release-key refresh — goes
+through Arti's SOCKS proxy, so this host's own address is never seen asking
+them the same questions every day. Each destination gets a circuit of its own
+(Arti isolates streams by SOCKS username), so no single exit sees the whole
+pattern, and a failed request is tried once more on a fresh circuit: an exit
+that refuses the port, or one whose shared address has used up GitHub's
+anonymous API allowance, costs a retry rather than an `unknown` row.
+
+The host reaches Arti at `10.89.0.10:9150` across the internal network's
+bridge, whose gateway address the host holds (see "Podman bridges are routable
+from the host itself" below), so nothing is published and no container joins a
+network for it. The timer's unit adds the kernel's half: `IPAddressDeny=any`
+with `IPAddressAllow=10.89.0.10/32`, so a request that somehow skipped the proxy
+fails instead of leaving. A helper container on the internal network was the
+other way to do this; it would have meant running podman from the timer, which
+needs every sandbox line in that unit switched off.
+
+If Arti cannot carry a request, **nothing is fetched and nothing falls back to
+the clearnet**. A stopped Arti is said so at once. A listening Arti that has not
+built a circuit yet — normal for a few minutes after it starts, which is also
+when `setup.sh` fires the first check — is waited for, up to ten minutes:
+
+```
+Waiting for Arti to build a circuit (up to 10 minutes)...
+Fetching through Tor, via Arti at 10.89.0.10:9150.
+```
+
+If it still cannot, the run says why, prints no table, and exits **75**
+(nothing was checked), as distinct from 1 (checked, and something needs you).
+The timer tries again the next day; `sudo systemctl start
+crypto-update-check.service` tries now. `--apply` refuses the same way and
+changes nothing.
+
+To fetch from this host's own address instead, as this bundle did before:
+
+```bash
+sudo UPDATE_CHECK_ROUTE=direct ./update.sh --check      # one run
+sudo UPDATE_CHECK_ROUTE=direct ./setup.sh               # the daily timer too
+```
+
+The second writes `/etc/systemd/system/crypto-update-check.service.d/route.conf`,
+which sets the variable and clears the two `IPAddress` lines; `systemctl cat
+crypto-update-check.service` shows it. A later `setup.sh` run without the
+variable keeps whichever route the host has; `UPDATE_CHECK_ROUTE=tor
+./setup.sh` removes that file again. Run by hand with the variable unset,
+`update.sh` follows the timer's route.
+
+What Tor does not hide: exits see which public sites are asked, as any
+visitor's would be, and the image rebuilds `--apply` hands over to still
+download over the clearnet (see "Install"). Docker Hub and the download sites
+occasionally refuse an exit; that shows as an `unknown` row with curl's reason,
+and the next day's check usually goes through.
 
 ### Applying
 
@@ -361,7 +441,8 @@ The unit records the path the bundle was installed from, so moving the bundle
 breaks the timer — rerun `setup.sh` from the new location to repoint it. A
 non-zero exit is deliberate signal rather than noise: it means a component was
 unreachable, or that a new release failed its signature threshold and was
-reported `BLOCKED`. Both show up in `systemctl --failed`.
+reported `BLOCKED`, or (75) that Arti could not carry the check at all. All of
+them show up in `systemctl --failed`.
 
 Applying is a different question per component:
 
@@ -460,6 +541,9 @@ Bitcoin and Litecoin RPC are authenticated with the generated `rpcauth`
 credentials. Monero has two endpoints: the daemon's restricted RPC and a
 separate, authenticated, spend-capable wallet RPC service.
 
+For CryptoStore, the end of `connection-details.txt` says which box on the
+store's Nodes page takes which value (see "Install").
+
 Default receive addresses are in
 `/etc/crypto-daemons/secrets/default-wallet-addresses.env`. RPC credentials
 and the BTC/LTC wallet passphrases are in
@@ -534,13 +618,19 @@ Not enforced, and worth understanding before funding anything:
   so nothing is reachable from the LAN, but root on this host can reach every
   container listener directly by IP. That is not a new exposure — root here can
   spend the coins anyway — but `ss -ltnp` showing no listener is a statement
-  about the host's own ports, not about unreachability.
-* **The daily update check runs on the host, not in a container**, so it
-  reaches bitcoincore.org, getmonero.org, GitHub, crates.io and Docker Hub over
-  the clearnet from this host's own IP, on a schedule. It sends curl's default
-  User-Agent rather than one naming this bundle, but the pattern of endpoints is
-  itself distinctive. Disable the timer and
-  run `--check` from elsewhere if that pattern matters to you.
+  about the host's own ports, not about unreachability. It holds for the
+  internal network too: its bridge carries the gateway address `10.89.0.1`
+  even with no route out and no DNS (measured on netavark 1.16.1), and that is
+  how the update check reaches Arti's SOCKS port. The same path is open to any
+  local user, not only root, so treat a shell account on this host as able to
+  use that proxy.
+* **The daily update check goes through Tor by default, and is only as
+  confined as its unit.** `UPDATE_CHECK_ROUTE=direct` (see "Which road the
+  requests take") puts it back on the clearnet from this host's own IP, where
+  the pattern of endpoints asked every day is itself distinctive. On a kernel
+  without cgroup BPF, systemd ignores the unit's `IPAddressDeny=` and logs
+  that it did; `update.sh`'s own routing still sends every request through
+  Arti, but the kernel no longer backs it.
 * **Peers are not restricted to onion.** Traffic is proxied, not onion-only, so
   Tor exit relays carry the clearnet portion of it and can read the unencrypted
   v1 P2P protocol. Add `onlynet=onion` to a chain's config if you would rather
@@ -585,10 +675,37 @@ prints the private half once. The private key is never stored on the server;
 capture it when it is printed. For a C-tor client it goes in
 `ClientOnionAuthDir` as `<onion-address-without-.onion>:descriptor:x25519:<key>`.
 
+A client that made its own key — every Arti client, CryptoStore's included —
+brings the public half instead, and nothing secret is made or shown:
+
+```bash
+sudo ./setup.sh --add-rpc-client bitcoin-rpc store --public-key 'descriptor:x25519:<52 base32 characters>'
+```
+
+The key is checked before anything is written: `descriptor:x25519:` and 52
+base32 characters, whose last must be `A` or `Q` (it carries one bit of key and
+four that Arti requires to be zero). Lower case and a missing prefix are
+accepted and normalised. A C-tor *client* line,
+`<onion address>:descriptor:x25519:<key>`, is refused outright, because that is
+a private key and has no business on this server. The same key under a second
+name is refused too, so that removing one file cannot look like revoking a
+client that the other still lets in.
+
 Only then uncomment that service's `restricted_discovery.enabled` line and its
 `key_dirs` block in `/etc/crypto-daemons/arti.toml`, and restart Arti. That file
 is installed once and never reinstalled, so a later `setup.sh` run leaves your
 edits in place.
+
+Once a service has restricted discovery on, `--add-rpc-client` (either form)
+restarts Arti itself so the new key takes effect, and reads Arti's log since
+the restart: Arti names a key file there only when it could not use it, and
+the command fails, quoting that line, if it did. A restart rather than a
+reload because Arti reads these keys when it starts; with Arti 2.8.0 a SIGHUP
+reloaded the configuration without any sign of rereading the key directory.
+The restart makes all four onion services unreachable for a few minutes while
+they republish. `RESTART_ARTI=no` skips it and leaves the new client locked
+out until your own next `systemctl restart arti`.
+
 **Enabling a service whose key directory is empty publishes a descriptor nobody
 can decrypt, which locks you out of it.** Do one service, confirm you can still
 reach it from a client holding the key, and only then do the rest.
@@ -602,15 +719,8 @@ client has no way to accept a pasted private key; it makes its own with
 `arti hsc key get` and prints the public half, as
 `descriptor:x25519:<52 base32 characters>`. That is the case for any
 application that reaches these nodes through its own Arti — CryptoStore's
-included. Authorize it the other way round: put that one line, exactly as
-printed, in a file of its own and install it as the client's key:
-
-```bash
-sudo install -m 0600 store.auth /srv/crypto-daemons/arti/authorized_clients/bitcoin-rpc/store.auth
-```
-
-The private half never leaves the client, which is the better arrangement
-anyway. Then enable the service as above.
+included — and is what `--public-key` above is for. The private half never
+leaves the client, which is the better arrangement anyway.
 
 Treat restricted discovery as what Arti's own documentation calls it, a
 denial-of-service resistance mechanism rather than access control: removing a

@@ -32,9 +32,10 @@ DropCapability=all
 # a subtly wrong check that restarts a daemon is worse than no check at all.
 # bash, not sh: /dev/tcp is a bash builtin and Debian's sh is dash.
 # 10.89.0.10, not 127.0.0.1: arti.toml binds SOCKS to this container's bridge
-# address only, so nothing is listening on loopback.  Keep these three copies of
-# the address -- Network= above, socks_listen in arti.toml, and this line -- in
-# step with each other.
+# address only, so nothing is listening on loopback.  Keep every copy of the
+# address -- Network= above, socks_listen in arti.toml, this line,
+# ARTI_SOCKS_HOST in lib.sh and IPAddressAllow= in crypto-update-check.service
+# -- in step with each other.
 # Single quotes, never double: Quadlet (5.4 on Debian 13) drops a double quote
 # that ends a value, so `bash -c "exec ..."` reached podman with its closing
 # quote missing, /bin/sh rejected it as an unterminated string, and this check
