@@ -14,6 +14,10 @@ umask 077
 readonly COMPONENTS=(bitcoin litecoin monero arti base rust)
 WORK=''
 trap '[[ -n $WORK ]] && rm -rf -- "$WORK"' EXIT
+# cmd_check's exit status.  Kept here rather than returned: under set -e a
+# function returning non-zero ends the script through the error trap, which
+# would announce a "stopped" run every time a component was merely unreachable.
+CHECK_RC=0
 
 usage() {
   cat <<USAGE
@@ -68,6 +72,15 @@ validate() {
   fi
 }
 
+version_newer() {
+  # True only when $1 is a strictly later version than $2.  GitHub's "latest"
+  # is whichever release was published last, and a maintenance release on an
+  # older branch (a 30.x shipped after 31.0) is published later.  Compared with
+  # plain inequality, as this used to be, that read as an UPDATE -- and --apply
+  # would have re-pinned the node DOWN a major version.
+  [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1) == "$1" ]]
+}
+
 pinned_keys()      { awk -v c="$1" '$1=="key" && $2==c {print toupper($3)}' "$FINGERPRINTS"; }
 pinned_threshold() { awk -v c="$1" '$1=="threshold" && $2==c {print $3}' "$FINGERPRINTS"; }
 
@@ -75,6 +88,18 @@ pinned_threshold() { awk -v c="$1" '$1=="threshold" && $2==c {print $3}' "$FINGE
 # match.  The fetch is therefore untrusted: keys/fingerprints.txt is the anchor.
 import_keys() {
   install -d -m 0700 "$KEYRING_DIR"
+  # Keys already held are fetched again once a week.  Fetching each key only
+  # the first time, as this used to, meant a revocation or a renewed expiry
+  # date published upstream never reached this keyring: the REVKEYSIG handling
+  # in verify_manifest could never fire, and a builder key past its original
+  # expiry date would have been reported EXPIRED for good.  Merging a fresh
+  # copy is safe for the same reason the first import is -- the primary
+  # fingerprint must still match the pin, and gpg takes only components that
+  # primary key signed.  A refresh that fails keeps the copy already held.
+  local stamp=$KEYRING_DIR/refreshed refresh=0 stale=0 have
+  if [[ ! -e $stamp || -n $(find "$stamp" -mmin +10080 2>/dev/null) ]]; then
+    refresh=1
+  fi
   local -a lines=()
   mapfile -t lines <"$FINGERPRINTS"
   local line kw chain fp url tmp=$WORK/key
@@ -83,8 +108,13 @@ import_keys() {
     read -r kw chain fp url <<<"$line"
     [[ ${kw:-} == key ]] || continue
     fp=${fp^^}
-    gpgr --list-keys "$fp" >/dev/null 2>&1 && continue
-    if ! fetch -o "$tmp" "$url"; then
+    have=0
+    if gpgr --list-keys "$fp" >/dev/null 2>&1; then
+      have=1
+      (( refresh )) || continue
+    fi
+    if ! fetch -o "$tmp" "$url" 2>/dev/null; then
+      if (( have )); then stale=$((stale + 1)); continue; fi
       printf 'Could not fetch key %s from %s\n' "$fp" "$url" >&2
       return 1
     fi
@@ -92,6 +122,7 @@ import_keys() {
     # bundle deliberately never touches and which the update timer's sandbox
     # makes read-only.  show-only implies --dry-run, so nothing is imported yet.
     if ! gpgr --with-colons --import-options show-only --import "$tmp" >"$tmp.list" 2>/dev/null; then
+      if (( have )); then stale=$((stale + 1)); continue; fi
       printf 'Could not read the key file fetched from %s\n' "$url" >&2
       return 1
     fi
@@ -101,50 +132,73 @@ import_keys() {
     mapfile -t got < <(awk -F: '$1=="pub"{p=1} $1=="fpr" && p {print toupper($10); p=0}' "$tmp.list")
     if (( ${#got[@]} != 1 )) || [[ ${got[0]} != "$fp" ]]; then
       printf 'Refusing key from %s: got %s, pinned %s\n' "$url" "${got[*]:-none}" "$fp" >&2
+      if (( have )); then stale=$((stale + 1)); continue; fi
       return 1
     fi
     gpgr --import "$tmp" >/dev/null 2>&1
   done
+  if (( refresh && ! stale )); then
+    touch "$stamp"
+  fi
+  if (( stale )); then
+    printf 'Could not refresh %d release key(s); verifying against the copies already held.\n' \
+      "$stale" >&2
+  fi
 }
 
 # Verify a chain's release manifest and echo the checksum of its x86_64 tarball.
 # Prints nothing and fails if the signature threshold is not met, so a caller
 # can never read a checksum out of an unverified document.
+#
+# Returns 1 when the release is refused, 3 when the manifest verified but does
+# not list the tarball yet, and 4 when the manifest could not be downloaded.
+# Callers run this in a command substitution, so why it failed is left in
+# $WORK/why for them to read, along with the signature counts.
 verify_manifest() {
   local chain=$1 version=$2
   local manifest=$WORK/manifest sig=$WORK/manifest.asc plain=$WORK/plain
   local status=$WORK/status tarball need good=0 fp
-  validate "the version of $chain" "$version" "$VERSION_RE" || return 1
+  # Reset every result first.  These files are the only way a caller learns
+  # why a check failed, and one chain's leftovers -- an earlier signature
+  # count, say -- must never be read as the next chain's.
+  rm -f -- "$manifest" "$sig" "$plain"
+  : >"$status"
+  printf '0\n' >"$WORK/sigcount"
+  printf '0\n' >"$WORK/expired"
+  printf '0\n' >"$WORK/revoked"
+  printf 'its release manifest could not be downloaded\n' >"$WORK/why"
+  if ! validate "the version of $chain" "$version" "$VERSION_RE"; then
+    printf 'upstream named a version that does not look like one\n' >"$WORK/why"
+    return 1
+  fi
   need=$(pinned_threshold "$chain")
   # An empty threshold would be arithmetic zero below, which reads as "no
   # signatures required" -- exactly backwards for a missing trust anchor.
   if [[ ! $need =~ ^[1-9][0-9]*$ ]]; then
+    printf 'keys/fingerprints.txt has no usable threshold for it\n' >"$WORK/why"
     printf 'refusing %s: no usable threshold for it in %s\n' "$chain" "$FINGERPRINTS" >&2
     return 1
   fi
-  # Never let one chain's artefacts survive into the next chain's check.
-  rm -f -- "$manifest" "$sig" "$plain"
-  : >"$status"
 
   case $chain in
     bitcoin)
       tarball="bitcoin-${version}-x86_64-linux-gnu.tar.gz"
-      fetch -o "$manifest" "https://bitcoincore.org/bin/bitcoin-core-${version}/SHA256SUMS" || return 1
-      fetch -o "$sig" "https://bitcoincore.org/bin/bitcoin-core-${version}/SHA256SUMS.asc" || return 1
+      fetch -o "$manifest" "https://bitcoincore.org/bin/bitcoin-core-${version}/SHA256SUMS" || return 4
+      fetch -o "$sig" "https://bitcoincore.org/bin/bitcoin-core-${version}/SHA256SUMS.asc" || return 4
       gpgr --status-fd 3 --verify "$sig" "$manifest" 3>"$status" >/dev/null 2>&1 || true
       cp "$manifest" "$plain"
       ;;
     litecoin)
       tarball="litecoin-${version}-x86_64-linux-gnu.tar.gz"
       fetch -o "$manifest" \
-        "https://github.com/litecoin-project/litecoin/releases/download/v${version}/SHA256SUMS.asc" || return 1
+        "https://github.com/litecoin-project/litecoin/releases/download/v${version}/SHA256SUMS.asc" || return 4
       # --decrypt emits only the signed body, so text smuggled outside the
       # clearsigned block cannot reach the checksum lookup below.
       gpgr --status-fd 3 --output "$plain" --decrypt "$manifest" 3>"$status" >/dev/null 2>&1 || true
       ;;
     monero)
       tarball="monero-linux-x64-v${version}.tar.bz2"
-      fetch -o "$manifest" 'https://www.getmonero.org/downloads/hashes.txt' || return 1
+      fetch -o "$manifest" 'https://www.getmonero.org/downloads/hashes.txt' || return 4
       gpgr --status-fd 3 --output "$plain" --decrypt "$manifest" 3>"$status" >/dev/null 2>&1 || true
       ;;
     *) return 1 ;;
@@ -170,25 +224,29 @@ verify_manifest() {
       good=$((good + 1))
     fi
   done
-  # Callers invoke this in a command substitution to capture the checksum, so
-  # the subshell cannot hand back variables; leave the counts in $WORK instead.
   printf '%s\n' "$good" >"$WORK/sigcount"
   if grep -q '^\[GNUPG:\] EXPKEYSIG' "$status"; then
     printf '1\n' >"$WORK/expired"
-  else
-    printf '0\n' >"$WORK/expired"
   fi
   if grep -q '^\[GNUPG:\] REVKEYSIG' "$status"; then
     printf '1\n' >"$WORK/revoked"
-  else
-    printf '0\n' >"$WORK/revoked"
   fi
   if (( good < need )); then
+    printf 'only %d of the %d required trusted signatures\n' "$good" "$need" >"$WORK/why"
     printf 'refusing %s %s: %d trusted signature(s), need %d\n' \
       "$chain" "$version" "$good" "$need" >&2
     return 1
   fi
-  awk -v t="$tarball" '$2 == t {print $1; found=1} END {exit !found}' "$plain"
+  # A signed manifest that does not list the tarball is not a signature
+  # failure.  It is what Monero's hashes.txt -- which covers one release only --
+  # looks like between a release appearing on GitHub and the site being
+  # updated, and it used to be reported as BLOCKED, "signature check failed".
+  if ! awk -v t="$tarball" '$2 == t {print $1; found=1} END {exit !found}' "$plain"; then
+    printf 'its checksum is not in the signed manifest yet\n' >"$WORK/why"
+    printf 'refusing %s %s: the signed manifest does not list %s yet\n' \
+      "$chain" "$version" "$tarball" >&2
+    return 3
+  fi
 }
 
 latest_version() {
@@ -223,32 +281,51 @@ pinned_version() {
   esac
 }
 
+image_for() {
+  case $1 in
+    bitcoin)  printf '%s\n' "$BITCOIN_IMAGE" ;;
+    litecoin) printf '%s\n' "$LITECOIN_IMAGE" ;;
+    monero)   printf '%s\n' "$MONERO_IMAGE" ;;
+  esac
+}
+
 report() { printf '  %-9s %-12s %s\n' "$1" "$2" "$3"; }
 
 cmd_check() {
-  local comp pinned latest sha note rc=0
+  local comp pinned latest sha note why pattern rc updates=0
   # Non-fatal, for the same reason the per-component fetches below are: all the
   # key URLs share one host, and an outage there must not cost the whole report.
   # Chains whose keys are missing then report BLOCKED, with this line above.
   if ! import_keys; then
     printf 'Some release keys could not be fetched; chain checks may report BLOCKED.\n' >&2
-    rc=1
+    CHECK_RC=1
   fi
   printf '\nComponent  Status       Detail\n'
   printf -- '---------------------------------------------------------------\n'
   for comp in "${COMPONENTS[@]}"; do
     pinned=$(pinned_version "$comp")
+    # Each probe's stderr is kept for its own row rather than printed: curl's
+    # complaints used to land in the middle of the table, above the row they
+    # belonged to.
+    : >"$WORK/err"
     case $comp in
       # Clear rather than `|| true`: latest is declared once outside the loop,
       # so a partial transfer must not leave a stale value to be read as a
       # bogus 'current' row for the next component.
-      base) latest=$(latest_digest library/debian trixie-slim) || latest='' ;;
-      rust) latest=$(latest_digest library/rust 1-trixie) || latest='' ;;
-      *)    latest=$(latest_version "$comp") || latest='' ;;
+      base) latest=$(latest_digest library/debian trixie-slim 2>"$WORK/err") || latest='' ;;
+      rust) latest=$(latest_digest library/rust 1-trixie 2>"$WORK/err") || latest='' ;;
+      *)    latest=$(latest_version "$comp" 2>"$WORK/err") || latest='' ;;
     esac
-    if [[ -z ${latest:-} ]]; then
-      report "$comp" 'unknown' 'could not reach upstream'
-      rc=1
+    if [[ -z $latest || $latest == null ]]; then
+      why=$(tail -n 1 "$WORK/err")
+      report "$comp" 'unknown' "could not reach upstream${why:+ ($why)}"
+      CHECK_RC=1
+      continue
+    fi
+    case $comp in base|rust) pattern=$DIGEST_RE ;; *) pattern=$VERSION_RE ;; esac
+    if [[ ! $latest =~ $pattern ]]; then
+      report "$comp" 'unknown' 'upstream answered with something that is not a version'
+      CHECK_RC=1
       continue
     fi
     if [[ $pinned == "$latest" ]]; then
@@ -256,8 +333,18 @@ cmd_check() {
       continue
     fi
     case $comp in
+      bitcoin|litecoin|monero|arti)
+        if ! version_newer "$latest" "$pinned"; then
+          report "$comp" 'current' "$pinned  (upstream's latest release is the older $latest)"
+          continue
+        fi
+        ;;
+    esac
+    case $comp in
       bitcoin|litecoin|monero)
-        if sha=$(verify_manifest "$comp" "$latest"); then
+        rc=0
+        sha=$(verify_manifest "$comp" "$latest" 2>/dev/null) || rc=$?
+        if (( rc == 0 )); then
           local count expired revoked
           count=$(<"$WORK/sigcount")
           expired=$(<"$WORK/expired")
@@ -269,13 +356,22 @@ cmd_check() {
           (( revoked )) && note+='  [a signing key is REVOKED and was not counted]'
           report "$comp" 'UPDATE' "$note"
           printf '  %-9s %-12s sha256:%s\n' '' '' "$sha"
+          updates=$((updates + 1))
+        elif (( rc == 3 )); then
+          # Not a failure: the release exists and nothing about it is wrong;
+          # there is just nothing verified to apply yet.  The next run will see it.
+          report "$comp" 'pending' "$latest is out; $(<"$WORK/why")"
+        elif (( rc == 4 )); then
+          report "$comp" 'unknown' "$latest is out, but $(<"$WORK/why")"
+          CHECK_RC=1
         else
-          report "$comp" 'BLOCKED' "$latest available but signature check failed"
-          rc=1
+          report "$comp" 'BLOCKED' "$latest: $(<"$WORK/why")"
+          CHECK_RC=1
         fi
         ;;
       *)
         report "$comp" 'UPDATE' "$pinned -> $latest"
+        updates=$((updates + 1))
         ;;
     esac
   done
@@ -288,16 +384,20 @@ cmd_check() {
   avail=$(df -BG --output=avail "$DATA_DIR" 2>/dev/null | tail -1 | tr -dc '0-9') || avail=''
   if [[ -z $avail ]]; then
     report 'disk' 'unknown' "could not read free space on $DATA_DIR"
-    rc=1
+    CHECK_RC=1
   elif (( avail < 25 )); then
     report 'disk' 'LOW' "${avail} GiB free on $DATA_DIR -- a full disk can damage Monero's LMDB"
-    rc=1
+    CHECK_RC=1
   else
     report 'disk' 'ok' "${avail} GiB free on $DATA_DIR"
   fi
   printf -- '---------------------------------------------------------------\n'
-  printf 'Apply with: sudo ./update.sh --apply <component>\n\n'
-  return $rc
+  # Only when there is something to apply; printed under an all-current table
+  # it read as an instruction with nothing to act on.
+  if (( updates )); then
+    printf 'Apply with: sudo ./update.sh --apply <component>\n'
+  fi
+  printf '\n'
 }
 
 repin_chain() {
@@ -330,7 +430,6 @@ repin_digest() {
   validate "the digest of $repo:$tag" "$digest" "$DIGEST_RE" || return 1
   # Safe to read the in-memory pin: lib.sh was sourced before anything rewrote it.
   if [[ $digest == "$(pinned_version "$comp")" ]]; then
-    printf '  %s already current\n' "$comp"
     return 2
   fi
   line="readonly ${var}='docker.io/${repo}@${digest}'"
@@ -343,35 +442,131 @@ repin_digest() {
   printf '  re-pinned %s to %s\n' "$var" "$digest"
 }
 
+pinned_not_deployed() {
+  # True, with a line saying so, when the pin for a component is not what this
+  # host runs.  A run that re-pinned a component and then stopped before
+  # deploying it -- a failed build, a dropped connection -- used to make the
+  # next --apply say "already current" and rebuild nothing, because it compared
+  # upstream only with the pin it had itself just written.  images.env records
+  # what the units actually point at.
+  local comp=$1 var want have
+  case $comp in
+    bitcoin|litecoin|monero) var=${comp^^}_IMAGE; want=$(image_for "$comp") ;;
+    arti) var=ARTI_IMAGE; want=$ARTI_IMAGE ;;
+    base) var=BASE_IMAGE; want=$BASE_IMAGE ;;
+    rust) var=ARTI_RUST_IMAGE; want=$ARTI_RUST_IMAGE ;;
+  esac
+  have=$(deployed_value "$var")
+  [[ -n $have && $have != "$want" ]] || return 1
+  printf '  %s is pinned at %s, but this host still runs %s; deploying the pin.\n' \
+    "$comp" "${want##*[:@]}" "${have##*[:@]}"
+}
+
+check_base_drift() {
+  # Refuses a rebuild that would quietly put some images on a different base
+  # from the rest.  A base given at install time (BASE_IMAGE=... ./setup.sh) is
+  # remembered only in images.env, so an --apply bitcoin months later used to
+  # rebuild bitcoin on the bundle's own pin instead, with nothing said, leaving
+  # one image on the operator's reviewed base and three on another.
+  #   $1   the command to suggest re-running, e.g. "--apply bitcoin"
+  #   $2.. the components being rebuilt
+  local again=$1; shift
+  local comp arti=0 base=0 rust=0 recorded var given current
+  for comp in "$@"; do
+    case $comp in
+      base) base=1; arti=1 ;;
+      rust) rust=1; arti=1 ;;
+      arti) arti=1 ;;
+    esac
+  done
+  for var in BASE_IMAGE ARTI_RUST_IMAGE; do
+    case $var in
+      BASE_IMAGE)      (( ! base )) || continue; given=$BASE_GIVEN; current=$BASE_IMAGE ;;
+      ARTI_RUST_IMAGE) (( arti && ! rust )) || continue; given=$RUST_GIVEN; current=$ARTI_RUST_IMAGE ;;
+    esac
+    [[ -z $given ]] || continue
+    recorded=$(deployed_value "$var")
+    [[ -n $recorded && $recorded != "$current" ]] || continue
+    cat <<DRIFT >&2
+This host's images were built with
+  $var=$recorded
+(recorded in $PREFIX/images.env), but this run would use
+  $var=$current
+Rebuilding only some of them would leave the deployment on two different
+images.  Either keep the one this host runs:
+  sudo $var='$recorded' ./update.sh $again
+or move everything to the bundle's pin:
+  sudo ./update.sh --redeploy
+Nothing was rebuilt.
+DRIFT
+    exit 1
+  done
+}
+
+refuse_apply() {
+  # Arguments: the components already re-pinned by this run, if any.  Their
+  # Containerfiles now name the new release, so say plainly that it has not
+  # been deployed -- and that re-running deploys it (see pinned_not_deployed).
+  if (( $# )); then
+    printf 'Re-pinned but not deployed: %s.  Running the same command again deploys\n' "$*" >&2
+    printf 'that once the problem above is resolved.\n' >&2
+  else
+    printf 'Nothing was changed.\n' >&2
+  fi
+  exit 1
+}
+
 cmd_apply() {
-  local comp latest sha file rc
+  local comp latest pinned sha file rc
   # Only what actually moved is redeployed.  Naming a component that turns out
   # to be current used to rebuild and restart it anyway, which is a needless
   # outage on a daemon that handles money.
   local -a changed=()
-  import_keys
+  # Every name is checked before anything is touched, so a typo in the last
+  # argument cannot leave the first ones re-pinned and undeployed.
   for comp in "$@"; do
     case $comp in
-      bitcoin|litecoin|monero)
-        latest=$(latest_version "$comp")
-        [[ $latest == "$(pinned_version "$comp")" ]] && { printf '  %s already current\n' "$comp"; continue; }
-        sha=$(verify_manifest "$comp" "$latest") || return 1
-        repin_chain "$comp" "$latest" "$sha"
-        changed+=("$comp")
-        ;;
-      arti)
-        latest=$(latest_version arti)
-        validate 'the version of arti' "$latest" "$VERSION_RE" || return 1
-        [[ $latest == "$ARTI_VERSION" ]] && { printf '  arti already current\n'; continue; }
-        file="$BUNDLE_DIR/containers/arti.Containerfile"
-        sed -i "s|^ARG ARTI_VERSION=.*|ARG ARTI_VERSION=${latest}|" "$file"
-        grep -qxF "ARG ARTI_VERSION=${latest}" "$file" || {
-          printf 'Failed to re-pin arti in %s; its ARG line is not where expected.\n' \
-            "$file" >&2
-          return 1
-        }
-        printf '  re-pinned arti to %s\n' "$latest"
-        changed+=(arti)
+      bitcoin|litecoin|monero|arti|base|rust) ;;
+      *) printf 'Unknown component: %s (components: %s)\n' "$comp" "${COMPONENTS[*]}" >&2; exit 64 ;;
+    esac
+  done
+  # Effective bases, as the rebuild will see them; set before the drift check
+  # and pinned_not_deployed read them.
+  BASE_GIVEN=${BASE_IMAGE:+1}
+  RUST_GIVEN=${ARTI_RUST_IMAGE:+1}
+  resolve_base_images
+  check_base_drift "--apply $*" "$@"
+  import_keys || refuse_apply
+  for comp in "$@"; do
+    case $comp in
+      bitcoin|litecoin|monero|arti)
+        pinned=$(pinned_version "$comp")
+        latest=$(latest_version "$comp") || latest=''
+        if [[ -z $latest || $latest == null ]]; then
+          printf 'Could not ask upstream for the latest %s release.\n' "$comp" >&2
+          refuse_apply "${changed[@]}"
+        fi
+        validate "the version of $comp" "$latest" "$VERSION_RE" || refuse_apply "${changed[@]}"
+        if version_newer "$latest" "$pinned"; then
+          if [[ $comp == arti ]]; then
+            file="$BUNDLE_DIR/containers/arti.Containerfile"
+            sed -i "s|^ARG ARTI_VERSION=.*|ARG ARTI_VERSION=${latest}|" "$file"
+            grep -qxF "ARG ARTI_VERSION=${latest}" "$file" || {
+              printf 'Failed to re-pin arti in %s; its ARG line is not where expected.\n' \
+                "$file" >&2
+              refuse_apply "${changed[@]}"
+            }
+            printf '  re-pinned arti to %s\n' "$latest"
+          else
+            sha=$(verify_manifest "$comp" "$latest") || refuse_apply "${changed[@]}"
+            repin_chain "$comp" "$latest" "$sha" || refuse_apply "${changed[@]}"
+          fi
+          changed+=("$comp")
+        elif pinned_not_deployed "$comp"; then
+          changed+=("$comp")
+        else
+          printf '  %s already current (%s)\n' "$comp" "$pinned"
+        fi
         ;;
       base|rust)
         rc=0
@@ -383,10 +578,13 @@ cmd_apply() {
         if (( rc == 0 )); then
           changed+=("$comp")
         elif (( rc != 2 )); then
-          return "$rc"
+          refuse_apply "${changed[@]}"
+        elif pinned_not_deployed "$comp"; then
+          changed+=("$comp")
+        else
+          printf '  %s already current\n' "$comp"
         fi
         ;;
-      *) printf 'Unknown component: %s\n' "$comp" >&2; return 64 ;;
     esac
   done
   if (( ${#changed[@]} == 0 )); then
@@ -400,79 +598,109 @@ cmd_apply() {
   # copy makes a $WORK of its own.
   rm -rf -- "$WORK"
   WORK=''
-  exec "$BUNDLE_DIR/update.sh" --redeploy "${changed[@]}"
+  # Through bash rather than relying on the file's execute bit, which a copy of
+  # the bundle does not always keep -- `sudo bash update.sh` would otherwise get
+  # as far as re-pinning and then fail here with "Permission denied".
+  exec bash "$BUNDLE_DIR/update.sh" --redeploy "${changed[@]}"
 }
 
 cmd_redeploy() {
   local -a comps=("$@")
   (( ${#comps[@]} )) || comps=("${COMPONENTS[@]}")
+  BASE_GIVEN=${BASE_IMAGE:+1}
+  RUST_GIVEN=${ARTI_RUST_IMAGE:+1}
   resolve_base_images
-  local comp rebuild_all=0
+  local comp all=0 arti=0 prev_arti
+  local -A wanted=()
   for comp in "${comps[@]}"; do
-    case $comp in arti|base|rust) rebuild_all=1 ;; esac
+    case $comp in
+      # The base image is under every image, so it is the one component that
+      # really does mean rebuilding and restarting everything.
+      base) all=1 ;;
+      # Arti and the Rust image it is compiled with touch Arti alone.  These
+      # used to rebuild and restart all five services as well -- both Core
+      # nodes and the Monero wallet included -- for a change none of them can
+      # see: the chains carry Wants=arti.service, not Requires=, precisely so
+      # that an Arti restart leaves them running.
+      arti|rust) arti=1 ;;
+      bitcoin|litecoin|monero) wanted[$comp]=1 ;;
+      *) printf 'Unknown component: %s (components: %s)\n' "$comp" "${COMPONENTS[*]}" >&2; exit 64 ;;
+    esac
   done
-
-  if (( rebuild_all )); then
-    build_all_images
+  local -a chains=()
+  if (( all )); then
+    arti=1
+    chains=(bitcoin litecoin monero)
   else
-    for comp in "${comps[@]}"; do
-      case $comp in
-        bitcoin)  build_daemon_image bitcoin "$BITCOIN_IMAGE" ;;
-        litecoin) build_daemon_image litecoin "$LITECOIN_IMAGE" ;;
-        monero)   build_daemon_image monero "$MONERO_IMAGE" ;;
-        *) printf 'Unknown component: %s\n' "$comp" >&2; return 64 ;;
-      esac
+    for comp in bitcoin litecoin monero; do
+      if [[ -n ${wanted[$comp]:-} ]]; then chains+=("$comp"); fi
     done
   fi
+  check_base_drift "--redeploy ${comps[*]}" "${comps[@]}"
+  prev_arti=$(deployed_value ARTI_IMAGE)
 
-  write_images_env
+  remember_bundle_images
+  if (( arti )); then
+    build_arti_image
+  fi
+  for comp in "${chains[@]}"; do
+    build_daemon_image "$comp" "$(image_for "$comp")"
+  done
+
   install_quadlets
+  write_images_env
 
-  if (( rebuild_all )); then
+  if (( all )); then
     # Everything is about to be restarted anyway, which is the only safe moment
     # to rebuild the network underneath it.
     migrate_internal_network
     restart_all_services
   else
-    for comp in "${comps[@]}"; do
-      systemctl restart "${comp}.service"
+    local -a units=()
+    if (( arti )); then units+=(arti.service); fi
+    for comp in "${chains[@]}"; do
+      units+=("${comp}.service")
       # monero-wallet-rpc runs the same image as monerod, and install_quadlets
-      # has already repointed its unit at the new tag.  Without this it keeps
-      # running the old container until something else restarts it, leaving a
-      # spend-capable wallet on a different Monero build from the daemon it
-      # talks to -- and doing so silently.
-      if [[ $comp == monero ]]; then
-        systemctl restart monero-wallet-rpc.service
-      fi
+      # has already repointed its unit at the new tag.  Its Requires= would
+      # restart it along with monerod anyway; naming it puts both in one
+      # transaction, so it restarts once and the intent is on the page.
+      if [[ $comp == monero ]]; then units+=(monero-wallet-rpc.service); fi
     done
+    systemctl restart "${units[@]}"
   fi
 
-  # Confirm the chain daemons actually answered after the restart, so a failed
-  # update is reported here rather than discovered later.  Only the ones this
-  # run actually touched: waiting on a daemon nobody restarted would turn an
-  # unrelated outage into a ten-minute hang.
-  for comp in "${comps[@]}"; do
-    case $comp in
-      bitcoin)  wait_for_core_rpc bitcoin bitcoin-cli ;;
-      litecoin) wait_for_core_rpc litecoin litecoin-cli ;;
-      arti|base|rust)
-        # These rebuild everything, so both Core daemons were restarted.
-        wait_for_core_rpc bitcoin bitcoin-cli
-        wait_for_core_rpc litecoin litecoin-cli
-        break
-        ;;
-    esac
-  done
-  prune_old_images
+  # Confirm each restarted service is actually answering, so a failed update is
+  # reported here rather than discovered later.  Only the ones this run
+  # touched: waiting on a daemon nobody restarted would turn an unrelated
+  # outage into a ten-minute hang.
+  local -a touched=()
+  if (( arti )); then touched+=(arti); fi
+  touched+=("${chains[@]}")
+  wait_for_services "${touched[@]}"
+  remove_superseded_images
   printf 'Update complete.  Deployed images:\n'
   sed 's/^/  /' "$PREFIX/images.env"
+  if (( arti )) && [[ -n $prev_arti && $prev_arti != "$ARTI_IMAGE" ]]; then
+    # Listening is all the wait above proves.  The failure worth knowing about
+    # after a version change is the one the README describes: a new Arti
+    # reading the old one's guard state and building no circuits at all.
+    cat <<'ARTI'
+
+Arti is listening on the new version.  Its SOCKS port answering does not prove
+it can build circuits: watch the chains' peer counts for the next few minutes,
+and if they fall to zero, see "After an Arti update" in the README.
+ARTI
+  fi
 }
+
+# Sourcing this file (a test harness does) defines the functions and stops.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
 WORK=$(mktemp -d)
 
 case ${1:-} in
   -h|--help) usage; exit 0 ;;
-  --check)    require_root; shift; cmd_check ;;
+  --check)    require_root; shift; cmd_check; exit "$CHECK_RC" ;;
   --apply)    require_root; shift; (( $# )) || { echo 'Name at least one component.' >&2; exit 64; }; cmd_apply "$@" ;;
   --redeploy) require_root; shift; cmd_redeploy "$@" ;;
   '')  usage >&2; exit 64 ;;

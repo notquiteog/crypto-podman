@@ -11,6 +11,6 @@ Internal=true
 # bridge and forwards queries to the host's resolvers, so a daemon that looked
 # up a seed hostname would leak the query even though the connection that
 # followed would fail.  Nothing on this network resolves names -- every peer is
-# addressed by static IP, and Bitcoin and Monero resolve through Arti's SOCKS
+# addressed by static IP, and all three chains resolve through Arti's SOCKS
 # proxy -- so disabling DNS costs nothing and closes that path.
 DisableDNS=true

@@ -68,7 +68,7 @@ maybe_install_podman_desktop() {
         echo 'Set PODMAN_DESKTOP_USER to the desktop login when installing as root.' >&2
         return 1
       fi
-          desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6) || desktop_home=''
+      desktop_home=$(getent passwd "$desktop_user" | cut -d: -f6) || desktop_home=''
       if [[ -z $desktop_home ]]; then
         echo "Podman Desktop user does not exist: $desktop_user" >&2
         return 1
@@ -104,7 +104,7 @@ warn_podman_version() {
 require_free_space_on() {
   # Refuse rather than skip when df cannot be read: a preflight that fails open
   # is worse than none, because it is quiet about it.
-  local path=$1 need=$2 what=$3 have
+  local path=$1 need=$2 what=$3 note=${4:-} have
   have=$(df -BG --output=avail "$path" 2>/dev/null | tail -1 | tr -dc '0-9') || have=''
   if [[ -z $have ]]; then
     printf 'Could not read free space on %s (%s); refusing to continue.\n' \
@@ -112,8 +112,8 @@ require_free_space_on() {
     exit 1
   fi
   if (( have < need )); then
-    printf 'Only %s GiB free on %s (%s); %s GiB is required.\n' \
-      "$have" "$path" "$what" "$need" >&2
+    printf 'Only %s GiB free on %s (%s); %s GiB is required%s.\n' \
+      "$have" "$path" "$what" "$need" "$note" >&2
     printf 'Free space or move it to a larger filesystem; MIN_FREE_GIB lowers\n' >&2
     printf 'the chain-data figure if you mean to run a smaller deployment.\n' >&2
     exit 1
@@ -126,14 +126,29 @@ require_free_space() {
   # Monero's LMDB damaged, so check before spending an hour building images.
   # The images are built into podman's store, which is regularly a different
   # filesystem from the chain data, so both are checked.
-  local need=${MIN_FREE_GIB:-150} store
-  if [[ ! $need =~ ^[0-9]+$ ]]; then
-    printf 'MIN_FREE_GIB must be a whole number of GiB; got %q\n' "$need" >&2
+  local budget=${MIN_FREE_GIB:-150} need store held floor note=''
+  if [[ ! $budget =~ ^[0-9]+$ ]]; then
+    printf 'MIN_FREE_GIB must be a whole number of GiB; got %q\n' "$budget" >&2
     exit 1
+  fi
+  need=$budget
+  # The budget is for the whole deployment, and on a re-run much of it is
+  # already on disk as chain data.  Asking for all of it again as FREE space
+  # refused a re-run on exactly the host that had been sized correctly -- once
+  # the chains had synced, 150 GiB was no longer free, and could not be.  So
+  # what is already held counts toward the budget, down to the 25 GiB that
+  # update.sh --check reports as LOW (or MIN_FREE_GIB, if that is lower).
+  held=$(du -s --block-size=1G "$DATA_DIR" 2>/dev/null | cut -f1) || held=0
+  [[ $held =~ ^[0-9]+$ ]] || held=0
+  if (( held > 1 )); then
+    floor=$(( budget < 25 ? budget : 25 ))
+    need=$(( budget - held ))
+    (( need >= floor )) || need=$floor
+    note=" (the ${budget} GiB budget, less ${held} GiB of chain data already here)"
   fi
   store=$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null) || store=''
   [[ -n $store && -d $store ]] || store=/var/lib
-  require_free_space_on "$DATA_DIR" "$need" 'chain data'
+  require_free_space_on "$DATA_DIR" "$need" 'chain data' "$note"
   require_free_space_on "$store" 20 'image builds'
 }
 
@@ -144,8 +159,12 @@ enable_time_sync() {
   # the ordering is a no-op and the nodes can start against an unsynchronised
   # clock, which Monero and both Core daemons all handle badly.
   if ! systemctl cat systemd-time-wait-sync.service >/dev/null 2>&1; then
-    echo 'systemd-time-wait-sync is not available; make sure the host clock is' >&2
-    echo 'synchronised by whatever means you already use.' >&2
+    # Debian 13 ships the unit in systemd-timesyncd, so this is the expected
+    # branch on a host that keeps time with chrony or ntpsec instead.
+    echo 'systemd-time-wait-sync is not installed (on Debian it comes with' >&2
+    echo 'systemd-timesyncd), so the nodes will not wait for a synchronised clock' >&2
+    echo 'at boot.  That is expected with chrony or ntpsec; make sure something' >&2
+    echo 'keeps this clock in sync.' >&2
     return 0
   fi
   # Without a bound this unit waits forever, and every container orders itself
@@ -159,8 +178,23 @@ TimeoutStartSec=5min
 TIMEOUT
   chmod 0644 /etc/systemd/system/systemd-time-wait-sync.service.d/timeout.conf
   systemctl daemon-reload
-  systemctl enable --now systemd-time-wait-sync.service ||
-    echo 'Could not enable systemd-time-wait-sync; clock ordering is advisory only.' >&2
+  # Enabling and starting are separate steps with separate failures.  One
+  # `enable --now` used to report "could not enable" when the enable had worked
+  # and the START had sat out its five minutes waiting for an NTP server -- the
+  # message sent the operator to the wrong problem.
+  if ! systemctl enable systemd-time-wait-sync.service >/dev/null; then
+    echo 'Could not enable systemd-time-wait-sync; the nodes will not wait for a' >&2
+    echo 'synchronised clock at boot.' >&2
+    return 0
+  fi
+  if [[ $(timedatectl show -p NTPSynchronized --value 2>/dev/null) != yes ]]; then
+    echo 'Waiting up to five minutes for the clock to synchronise...'
+  fi
+  if ! systemctl start systemd-time-wait-sync.service; then
+    echo 'The clock has not synchronised after five minutes.  Continuing -- the' >&2
+    echo 'nodes start regardless, and at boot they wait no longer than this -- but' >&2
+    echo 'check timedatectl: both Core daemons and Monero handle a skewed clock badly.' >&2
+  fi
 }
 
 random_password() { openssl rand -hex 32; }
@@ -295,7 +329,21 @@ capture_bitcoin_descriptors() {
 
 capture_litecoin_dump() {
   local out="$PREFIX/secrets/litecoin-wallet-dump.txt"
+  local leftover="$DATA_DIR/litecoin/wallet-dump.txt"
   [[ -s $out ]] && return 0
+  # A run that stopped between dumpwallet and the mv below left the dump in the
+  # chain data directory, and dumpwallet refuses to overwrite an existing file
+  # -- so every later run failed at this same step, with the wallet unlocked
+  # for a minute each time.  A complete dump ends with Core's "End of dump"
+  # line: finish moving that one; anything shorter is destroyed and redone.
+  if [[ -e $leftover ]]; then
+    if tail -n 1 "$leftover" | grep -q '^# End of dump'; then
+      mv "$leftover" "$out"
+      chmod 0600 "$out"
+      return 0
+    fi
+    shred -u -z -- "$leftover"
+  fi
   printf '%s\n' "$LITECOIN_WALLET_PASSPHRASE" |
     podman exec -i litecoin litecoin-cli -datadir=/data -rpcwallet=default \
       -stdinwalletpassphrase walletpassphrase 60 >/dev/null
@@ -403,11 +451,13 @@ or journalling filesystem, or on flash with wear levelling -- treat this as
 closing the obvious hole, not as forensic erasure.
 
 WARN
-  local answer
-  read -r -p 'Type SHRED to continue: ' answer
+  local answer=''
+  # || answer='': with no terminal, read fails at end of input and errexit
+  # would end the run without the line below saying nothing was touched.
+  read -r -p 'Type SHRED to continue: ' answer || answer=''
   if [[ $answer != SHRED ]]; then
     echo 'Aborted; nothing was removed.'
-    return 1
+    exit 1
   fi
   local rc=0
   for f in "${present[@]}"; do
@@ -421,7 +471,9 @@ WARN
   if (( rc )); then
     echo 'Some files could not be destroyed; the spend keys they hold are still' >&2
     echo 'on this server.  Investigate before assuming they are gone.' >&2
-    return 1
+    # exit, not return: the message above is complete, and a return here would
+    # also have the error trap announce a "stopped" run on top of it.
+    exit 1
   fi
   echo 'Done.  setup.sh --print-recovery will now report the material as unavailable.'
 }
@@ -431,29 +483,34 @@ add_rpc_client() {
   # half is authorized here, the private half is printed once for the client.
   # This only takes effect once the service's restricted_discovery block is
   # uncommented in arti.toml -- see the notes there, and rebuild Arti first.
+  # Refusals exit rather than return: each message is complete on its own, and
+  # a return would also have the error trap report a "stopped" run.
   local service=${1:-} name=${2:-} dir tmp pub priv
   case $service in
     bitcoin-rpc|litecoin-rpc|monero-rpc|monero-wallet-rpc) ;;
     *)
       echo 'Service must be one of: bitcoin-rpc litecoin-rpc monero-rpc monero-wallet-rpc' >&2
-      return 64
+      exit 64
       ;;
   esac
   # The name becomes a filename in a directory Arti reads; keep it boring.
   if [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then
     echo 'Client name must be alphanumeric, with - and _ allowed after the first character.' >&2
-    return 64
+    exit 64
   fi
   dir="$DATA_DIR/arti/authorized_clients/$service"
   install -d -m 0700 "$dir"
   if [[ -e $dir/$name.auth ]]; then
     echo "A client called $name is already authorized for $service." >&2
     echo "Remove $dir/$name.auth first if you mean to reissue its key." >&2
-    return 1
+    exit 1
   fi
   tmp=$(mktemp -d)
+  # EXIT, not RETURN: key.pem below is the client's PRIVATE key, and a RETURN
+  # trap does not run when errexit ends the script part way through -- which
+  # left that key behind in /tmp whenever an openssl step failed.
   # shellcheck disable=SC2064
-  trap "rm -rf -- '$tmp'" RETURN
+  trap "rm -rf -- '$tmp'" EXIT
   openssl genpkey -algorithm x25519 -out "$tmp/key.pem"
   # Both DER encodings put the raw 32-byte key last, which is what Tor's
   # base32 client-auth format wants.
@@ -484,6 +541,12 @@ onion_address() {
   # The identity exists as soon as the service launches, but arti needs a moment
   # after start before the command answers.
   local nickname=$1 address
+  # Without this, a stopped Arti cost two minutes per service -- eight before
+  # --print-details printed anything -- for an answer known at the first try.
+  if [[ $(podman inspect --format '{{.State.Running}}' crypto-arti 2>/dev/null) != true ]]; then
+    printf 'unavailable — Arti is not running (systemctl status arti)'
+    return 0
+  fi
   for _ in {1..60}; do
     address=$(podman exec crypto-arti arti --config /etc/arti/arti.toml hss \
       --nickname "$nickname" onion-address 2>/dev/null | tr -d '\r\n')
@@ -494,6 +557,16 @@ onion_address() {
     sleep 2
   done
   printf 'unavailable — check: systemctl status arti'
+}
+
+require_installed() {
+  # --print-details and --print-recovery on a host this has never run on used
+  # to end in a bare "No such file or directory" from the shell.
+  if [[ ! -s $PREFIX/secrets/rpc-credentials.env ]]; then
+    echo "Nothing is installed here yet ($PREFIX/secrets is empty)." >&2
+    echo 'Run sudo ./setup.sh first.' >&2
+    exit 1
+  fi
 }
 
 print_operator_summary() {
@@ -569,8 +642,12 @@ or curl --socks5-hostname): .onion has no DNS.
   locked.  After roughly 1000 addresses getnewaddress fails with "Keypool
   ran out" until the wallet is unlocked once.
 * The Monero wallet RPC has no lock: while running it can always spend.
-* Treat every onion address as a secret.  There is no authorization at the
-  Tor layer, so the address plus these credentials is the entire gate.
+* Treat every onion address as a secret.  Unless restricted discovery has
+  been turned on (README), there is no authorization at the Tor layer, so the
+  address plus these credentials is the entire gate.
+* Onion addresses answer only once Arti has bootstrapped and published them,
+  usually a few minutes after it starts; a client that connects sooner gets a
+  descriptor-not-found error, not a wrong-password one.
 
   Monero recovery seed (NOT needed to operate; back it up offline):
     $PREFIX/secrets/monero-default-wallet-recovery.txt
@@ -615,13 +692,16 @@ main() {
   # gnupg and jq are for update.sh: it verifies upstream release signatures and
   # parses the GitHub, crates.io and registry APIs.  Without jq every component
   # check fails, so it is a hard dependency of the bundle, not an extra.
+  # nftables is named because --no-install-recommends skips it: it is only a
+  # Recommends of netavark, podman's network backend, whose nftables firewall
+  # driver programs the bridges' rules through it.  It is Priority: important, so
+  # a normal install already has it; naming it keeps a minimal image from
+  # depending on that.  Installing it changes no rules and enables nothing.
+  # (aardvark-dns, the other Recommends, is not needed: neither network here
+  # has container DNS.)
   apt-get install -y --no-install-recommends podman uidmap slirp4netns fuse-overlayfs \
-    ca-certificates openssl xxd gnupg curl jq
+    nftables ca-certificates openssl xxd gnupg curl jq
   warn_podman_version
-  # Optional and cosmetic; a failure here must not take the install with it.
-  maybe_install_podman_desktop ||
-    echo 'Podman Desktop step failed; continuing without it.' >&2
-  enable_time_sync
 
   install -d -m 0755 "$PREFIX" "$QUADLET_DIR" "$DATA_DIR" "$DATA_DIR/arti"
   # 0700, not 0755: capture_litecoin_dump has litecoind write a cleartext copy
@@ -638,7 +718,14 @@ main() {
   # Created here rather than on first use so the update timer's unit can name it
   # in ReadWritePaths= under ProtectSystem=strict.
   install -d -m 0700 "$KEYRING_DIR"
+  # Before the two steps below that can wait (a prompt, and up to five minutes
+  # for the clock), so a disk that is too small is reported straight away.
   require_free_space
+  # Optional and cosmetic; a failure here must not take the install with it.
+  maybe_install_podman_desktop ||
+    echo 'Podman Desktop step failed; continuing without it.' >&2
+  enable_time_sync
+
   initialize_secrets
   install_configs
   # install_configs reinstalls both Core configs from the bundle, dropping the
@@ -648,10 +735,11 @@ main() {
   # existence guard inside makes this a no-op on a first install.
   autoload_wallet bitcoin "$PREFIX/bitcoin.conf"
   autoload_wallet litecoin "$PREFIX/litecoin.conf"
-  write_images_env
 
+  remember_bundle_images
   build_all_images
   install_quadlets
+  write_images_env
   migrate_internal_network
   restart_chain_services
 
@@ -666,7 +754,7 @@ main() {
   capture_litecoin_dump
   ensure_monero_wallet
   systemctl restart monero-wallet-rpc.service
-  prune_old_images
+  remove_superseded_images
   # Last, not with the other installs: Persistent=true and no stamp file means
   # the timer fires its first check the moment it is enabled, and that is worth
   # far less noise once the install has actually finished.
@@ -676,6 +764,9 @@ main() {
   print_recovery_summary
 }
 
+# Sourcing this file (a test harness does) defines the functions and stops.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
 case ${1:-} in
   -h|--help)
     usage
@@ -683,24 +774,26 @@ case ${1:-} in
     ;;
   --print-details)
     require_root
+    require_installed
     print_operator_summary
     exit 0
     ;;
   --print-recovery)
     require_root
+    require_installed
     print_recovery_summary
     exit 0
     ;;
   --shred-recovery)
     require_root
     shred_recovery
-    exit $?
+    exit 0
     ;;
   --add-rpc-client)
     require_root
     shift
     add_rpc_client "${1:-}" "${2:-}"
-    exit $?
+    exit 0
     ;;
   '')
     main

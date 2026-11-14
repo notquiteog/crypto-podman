@@ -11,7 +11,7 @@ Podman networks:
 | Network | Members | Route to the internet |
 |---|---|---|
 | `crypto` | Arti, Bitcoin, Litecoin, Monero, Monero wallet RPC | none — `--internal --disable-dns` |
-| `crypto-egress` | Arti | yes |
+| `crypto-egress` | Arti | yes (no container DNS: Arti resolves nothing locally) |
 
 Arti is on both, and is the only way anything on `crypto` reaches the outside
 world. A daemon there cannot open a clearnet connection or resolve a hostname
@@ -47,7 +47,7 @@ say the hardening had not applied. `setup.sh` and `update.sh --redeploy` both
 check the live network's flags and rebuild it when they do not match, which
 stops the daemons briefly. They refuse to continue if something is still
 attached to the old network, rather than leave you looking hardened while
-Bitcoin and Monero still have a route out. To check by hand:
+the daemons still have a route out. To check by hand:
 
 ```bash
 sudo podman network inspect crypto --format 'internal={{.Internal}} dns={{.DNSEnabled}}'
@@ -76,7 +76,9 @@ months on Litecoin, for about 19 GB of extra disk across the two.
    non-pruned Bitcoin node would instead need hundreds of GB. `setup.sh` refuses
    to start below that budget, checking both the chain-data filesystem and
    podman's image store, which are often not the same one; set `MIN_FREE_GIB`
-   to lower the chain-data figure deliberately. A disk that fills during initial
+   to lower the chain-data figure deliberately. On a re-run, chain data already
+   on disk counts toward that budget, so a synced host is not asked for 150 GB
+   free again — only for the remainder, and never less than 25 GiB. A disk that fills during initial
    sync is the one failure here that can leave Monero's database damaged.
 2. Review the two pinned build base images, or replace them with your own.
    `setup.sh` ships a reviewed, digest-pinned default for each, so a clean
@@ -120,6 +122,14 @@ run. It is for whoever edits the bundle; no deployed host needs it.
 
 Expect it to take a while: it compiles arti from source and downloads three
 daemon release tarballs before the nodes ever start syncing.
+
+Those downloads are the one part of the install that does **not** go through
+Tor. The image builds run on the host's own network: the two base images from
+Docker Hub, Debian packages from its mirrors, arti's crates from crates.io, and
+the release tarballs from bitcoincore.org, download.litecoin.org and
+downloads.getmonero.org. Only the daemons, once running, are confined to Tor.
+If this host's address must never be seen asking for those things, build the
+images somewhere else and load them here.
 
 To build against your own reviewed bases instead of the shipped pins:
 
@@ -228,7 +238,10 @@ sudo ./update.sh --check
 
 Read-only. For each component it reports the pinned version against what
 upstream currently offers, and for the three daemons it downloads the release
-manifest and verifies its signatures before showing you the checksum:
+manifest and verifies its signatures before showing you the checksum.
+Upstream's "latest" is only an update when it is a *later* version: a
+maintenance release on an older branch, published after the pinned one, is
+reported `current` with a note, and `--apply` never moves a pin backwards.
 
 ```
   bitcoin   UPDATE       31.1 -> 31.2  (11 trusted sigs)
@@ -245,9 +258,15 @@ failure it guards against — a full disk during sync, which is what can damage
 Monero's database — arrives months later. Below 25 GiB it reports `LOW` and
 exits non-zero.
 
-A release whose signature does not meet the threshold is reported `BLOCKED` and
-its checksum is never printed, so an unverified hash cannot be copied into a pin
-by hand either.
+A release whose signature does not meet the threshold is reported `BLOCKED`,
+with how many of the required signatures it has, and its checksum is never
+printed, so an unverified hash cannot be copied into a pin by hand either.
+`pending` means the release exists and its signed manifest verified but does
+not list the tarball yet — normal for Monero, whose `hashes.txt` covers one
+release and is updated after the release appears — and is not a failure.
+`unknown` means upstream could not be reached, with curl's reason in the row.
+`BLOCKED`, `unknown` and `LOW` make the command exit non-zero; `UPDATE` and
+`pending` do not.
 
 ### Applying
 
@@ -262,11 +281,45 @@ answer RPC again before reporting success. Components are `bitcoin`,
 several at once. There is deliberately no "apply everything" flag — see below.
 
 Only components that actually moved are rebuilt and restarted; naming one that
-turns out to be current reports it and leaves it running.
+turns out to be current reports it and leaves it running. `arti` and `rust`
+rebuild and restart Arti alone — the chains keep running through it, since
+they only `Want` it — while `base` is under every image and restarts all five
+services.
+
+If a run stops after re-pinning but before deploying (a failed build, a
+dropped connection), run the same `--apply` again: it compares the pin with
+what this host actually runs, recorded in `/etc/crypto-daemons/images.env`,
+and deploys the pin rather than calling it current.
+
+A base image given at install time (`BASE_IMAGE=… ./setup.sh`) is remembered
+only in `images.env`. A later partial rebuild that would put some images on a
+different base is refused, with the two commands that resolve it: pass the
+same `BASE_IMAGE` again, or `--redeploy` everything onto the bundle's pin.
 
 `sudo ./update.sh --redeploy` rebuilds and restarts from the pins exactly as
 they stand, without consulting upstream. Use it after editing a Containerfile
 by hand.
+
+### After an Arti update
+
+`--apply arti` waits for Arti's SOCKS port to answer, and that is all it can
+prove: a listening Arti can still be unable to build a single circuit. The
+failure seen in practice is a new Arti reading the previous version's guard
+state — `No usable guards. Rejected 60/60 as down` in `journalctl -u arti` —
+while directory downloads carry on working and look healthy. Watch the chains'
+peer counts for a few minutes after a version change; if they fall to zero
+with that line in Arti's log:
+
+```bash
+sudo systemctl stop arti
+sudo mv /srv/crypto-daemons/arti/state/guards.json /srv/crypto-daemons/arti/state/guards.json.old
+sudo systemctl start arti
+```
+
+**Never clear `/srv/crypto-daemons/arti` as a fix.** It also holds the
+keystore, which *is* the four onion addresses; Arti would come back healthy
+under addresses no client knows. Moving the one file costs a fresh set of
+entry guards and nothing else.
 
 ### How releases are trusted
 
@@ -275,7 +328,9 @@ fingerprint of every signer this bundle accepts, and how many must agree.
 Key material itself is fetched from the projects' own repositories at check
 time, but nothing is imported unless its fingerprint already appears in that
 file, so the download does not have to be trusted — only the list, which is
-reviewable in git. Keys go into a keyring under `/etc/crypto-daemons/keys`
+reviewable in git. Keys already held are fetched again once a week, so a
+revocation or a renewed expiry date published upstream reaches the keyring; a
+refresh that fails is reported in one line and the copy already held is used. Keys go into a keyring under `/etc/crypto-daemons/keys`
 rather than root's, so verifying a release never widens what the rest of the
 system trusts.
 
@@ -398,6 +453,8 @@ Two things do not survive a restart:
 The wallets themselves are loaded automatically: `setup.sh` writes a
 `wallet=default` line into each Core config once the wallet exists.
 
+## Connecting a client
+
 Use a Tor SOCKS proxy on the client and standard HTTP Basic authentication.
 Bitcoin and Litecoin RPC are authenticated with the generated `rpcauth`
 credentials. Monero has two endpoints: the daemon's restricted RPC and a
@@ -420,9 +477,10 @@ Enforced:
 
 * Arti's SOCKS proxy — the one listener here that takes no credentials — is
   bound to its internal-bridge address rather than to `0.0.0.0`, so it does not
-  also appear on the egress network. Only Bitcoin and Monero proxy through it,
-  and both are internal. On a host installed before this change, the deployed
-  `arti.toml` keeps its old `socks_listen`; a re-run prints the diff to apply.
+  also appear on the egress network. All three chains proxy through it, and
+  all of them are on the internal network. On a host installed before this
+  change, the deployed `arti.toml` keeps its old `socks_listen`; a re-run
+  prints the diff to apply.
 * No port is published to the host. Every listener exists only inside the
   private Podman networks; the only way in is an onion service.
 * No daemon has a route to the internet at all. `crypto.network` is created
@@ -489,13 +547,16 @@ Not enforced, and worth understanding before funding anything:
   have a smaller peer set than an observable one; Bitcoin and Monero sustain
   that well, Litecoin does not.
 * **Litecoin's provenance is weaker** than the other two — a single signature
-  from an expired key. Its node remains the least trustworthy component here. Its node is the
-  least trustworthy component in this bundle.
+  from an expired key. Its node is the least trustworthy component in this
+  bundle.
+* **The install itself is not routed through Tor.** The image builds fetch
+  from Docker Hub, Debian's mirrors, crates.io and the three projects'
+  download sites from this host's own address; see "Install".
 
 ## Restricted discovery
 
 By default an onion address is the only thing standing between the internet and
-an RPC login prompt. Restricted discovery adds a real second gate: Arti encrypts
+an RPC login prompt. Restricted discovery adds a second gate: Arti encrypts
 the service descriptor to a set of x25519 client keys, so a client without a key
 cannot even find the service, let alone attempt to authenticate.
 
@@ -535,6 +596,27 @@ reach it from a client holding the key, and only then do the rest.
 The key format and directory layout follow C-tor's client-authorization
 convention. Verify the first service end to end before converting the others,
 and keep a way in — an unconverted service, or console access — while you do.
+
+**An Arti client cannot use the key `--add-rpc-client` prints.** Arti as a
+client has no way to accept a pasted private key; it makes its own with
+`arti hsc key get` and prints the public half, as
+`descriptor:x25519:<52 base32 characters>`. That is the case for any
+application that reaches these nodes through its own Arti — CryptoStore's
+included. Authorize it the other way round: put that one line, exactly as
+printed, in a file of its own and install it as the client's key:
+
+```bash
+sudo install -m 0600 store.auth /srv/crypto-daemons/arti/authorized_clients/bitcoin-rpc/store.auth
+```
+
+The private half never leaves the client, which is the better arrangement
+anyway. Then enable the service as above.
+
+Treat restricted discovery as what Arti's own documentation calls it, a
+denial-of-service resistance mechanism rather than access control: removing a
+client's `.auth` file is not guaranteed to revoke a client that already found
+the service, because the introduction points are not rotated when the list
+changes. The RPC credentials remain the real lock.
 
 ## Important operating notes
 
@@ -590,12 +672,18 @@ and keep a way in — an unconverted service, or console access — while you do
   reads as success, which `Restart=always` and the restart counter still expose.
   Arti's state under `/srv/crypto-daemons/arti` therefore has to tolerate an
   abrupt stop — one more reason the README asks you to back it up.
-* `setup.sh` and `update.sh` remove this bundle's own superseded
-  `localhost/crypto-*` image tags after a successful restart. Nothing else is
-  touched, and an image still in use is left alone. Dangling layers from the
-  multi-stage builds are deliberately *not* swept: `podman image prune` cannot
-  be scoped to one bundle, and this host may not be dedicated to it. Run it
-  yourself if it is.
+* `setup.sh` and `update.sh` note the ID of every `localhost/crypto-*` image
+  before they build, and once the restarted services answer they remove, by
+  that exact ID and without force, each one no current tag points at any more
+  — the old tag after a version bump, and the now-untagged image after a base
+  refresh rebuilt under the same tag. They report how many went, and name any
+  that podman kept because a container still uses it. Nothing outside those
+  four repositories is ever a candidate, so there is no `podman image prune`
+  here: it acts on the whole host, which may not be dedicated to this. The
+  layers of arti's Rust build stage are not reachable from those IDs and stay
+  behind as build cache — they are what lets a re-run skip recompiling arti.
+  After several Arti versions they are worth reclaiming by hand, by ID, with
+  `podman images -a`.
 * Changing `prune` is not retroactive. Raising it keeps more from the restart
   onwards; blocks already deleted are gone, so a freshly raised target takes a
   full window to become useful. Lowering it prunes back down immediately.
@@ -621,6 +709,13 @@ and keep a way in — an unconverted service, or console access — while you do
   writes; Monero, its wallet RPC and Arti are checked with a TCP connect,
   because an RPC call there could fail on credentials and report a healthy
   daemon as sick.
+  Those three TCP checks were written with double quotes until this was run
+  through Debian 13's Quadlet, which drops a double quote that ends a value:
+  podman received `bash -c "exec 3<>/dev/tcp/…` with no closing quote, `/bin/sh`
+  rejected it, and Arti, Monero and the wallet RPC showed `unhealthy` for
+  ever. They are single-quoted now. A host installed earlier gets the fixed
+  units from its next `setup.sh` or `update.sh --redeploy`, and each service
+  takes its fixed check on its next restart.
 * The daemon units order themselves `After=time-sync.target`, and `setup.sh`
   enables `systemd-time-wait-sync` so that target is actually reached — on its
   own the ordering is a no-op, because nothing pulls that target in by default.
@@ -633,9 +728,9 @@ and keep a way in — an unconverted service, or console access — while you do
   handle a badly skewed clock poorly.
 * Review firewall rules separately.  This bundle publishes no ports, but it
   does not overwrite an existing host firewall.
-* To update an image, stop the affected service cleanly, rerun the script with
-  the reviewed immutable digest (recorded in `/etc/crypto-daemons/images.env`),
-  and validate the chain's upgrade notes first.
+* To update an image, use `update.sh` (see "Applying security updates"), and
+  read the chain's upgrade notes first. `/etc/crypto-daemons/images.env`
+  records exactly which images the installed units run.
 
 ## Checks
 

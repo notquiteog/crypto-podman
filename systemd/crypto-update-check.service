@@ -8,7 +8,11 @@ Type=oneshot
 # --check is read-only: it re-pins nothing, restarts nothing, and cannot print
 # wallet recovery material or RPC credentials, because those functions live in
 # setup.sh.  That is what makes it safe here, where stdout lands in the journal.
-ExecStart=@@BUNDLE_DIR@@/update.sh --check
+# Through bash rather than relying on update.sh's execute bit, which a copy of
+# the bundle does not always keep; without it this unit failed every day with
+# status 203/EXEC while `sudo bash setup.sh` had worked fine.  Quoted so a
+# bundle path containing a space is still one argument.
+ExecStart=/bin/bash "@@BUNDLE_DIR@@/update.sh" --check
 # A non-zero exit is meaningful rather than noise: it means a component could
 # not be reached, or that a new release failed its signature threshold and was
 # reported BLOCKED.  Both are things worth seeing in `systemctl --failed`.

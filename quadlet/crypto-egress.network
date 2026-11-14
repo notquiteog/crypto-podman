@@ -6,3 +6,12 @@
 NetworkName=crypto-egress
 Subnet=10.89.1.0/24
 Gateway=10.89.1.1
+# Arti resolves nothing locally: it reaches the Tor network by the relay
+# addresses in its consensus, and a name a client asks for is resolved by the
+# exit.  So container DNS here only ever meant an aardvark-dns forwarder to the
+# host's resolvers that nothing used -- and aardvark-dns is a Recommends that
+# setup.sh's --no-install-recommends does not install, so on Debian 13 it was
+# not even running ("dns disabled because aardvark-dns path ... does not
+# exist").  Saying so here keeps the unit honest about what the network does.
+# An existing network keeps whatever it was created with; that is harmless.
+DisableDNS=true

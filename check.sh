@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Syntax and lint gate for the three scripts in this bundle.
+# Syntax and lint gate for the four scripts in this bundle (lib.sh, setup.sh,
+# update.sh, and this one).
 #
 # Worth having because update.sh rewrites lib.sh and the Containerfiles in
 # place, and root sources lib.sh on the very next invocation, so a bad rewrite

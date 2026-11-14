@@ -28,6 +28,31 @@ readonly KEYRING_DIR="$PREFIX/keys"
 readonly BUILD_CONTEXT="$PREFIX/build"
 readonly FINGERPRINTS="$BUNDLE_DIR/keys/fingerprints.txt"
 readonly SERVICES=(arti.service bitcoin.service litecoin.service monero.service)
+# Every image repository this bundle builds into.  Superseded images are only
+# ever looked for here, so nothing else on the host can be touched.
+readonly IMAGE_REPOS=(localhost/crypto-arti localhost/crypto-bitcoin localhost/crypto-litecoin localhost/crypto-monero)
+
+on_error() {
+  # Under set -e a failing step used to end the run with only the failing
+  # command's own output -- often a bare podman or curl line -- and nothing to
+  # say that the run had stopped, or whether it was safe to try again.  Both
+  # scripts are written to be re-run, so say so.  Only the top-level shell
+  # reports: set -E hands this trap to every command substitution as well, and
+  # a failure inside one would otherwise be announced twice.
+  #
+  # The step is quoted from the source line, not taken from $BASH_COMMAND: when
+  # a function of this bundle fails, $BASH_COMMAND is the last thing it ran --
+  # usually "return 1" -- which names nothing.  BASH_SOURCE[1] is the file the
+  # trap fired in, so a failure inside lib.sh is pointed at lib.sh.
+  local status=$? line=$1 file=${BASH_SOURCE[1]:-$0} text
+  (( BASH_SUBSHELL == 0 )) || return 0
+  text=$(sed -n "${line}{s/^[[:space:]]*//;p;q;}" "$file" 2>/dev/null) || text=''
+  (( ${#text} <= 100 )) || text="${text:0:97}..."
+  printf '\n%s stopped (exit %s) at %s line %s:\n  %s\n' \
+    "${0##*/}" "$status" "${file##*/}" "$line" "$text" >&2
+  printf 'Nothing after that step ran.  Fix the cause above, then run the same command again; it is safe to repeat.\n' >&2
+}
+trap 'on_error "$LINENO"' ERR
 
 containerfile_arg() {
   # Read an ARG default straight out of the Containerfile that consumes it.
@@ -137,6 +162,25 @@ wait_for_core_rpc() {
     sleep 2
   done
   echo "$container RPC did not become ready within ten minutes." >&2
+  echo "Its own log says why: journalctl -u $container -n 50" >&2
+  return 1
+}
+
+wait_for_listener() {
+  # For the three services whose RPC needs credentials (and Arti, which has no
+  # RPC at all): a TCP connect inside the container, the same probe as their
+  # health checks, so a successful update is reported only once the process is
+  # actually accepting connections.  Container and unit names differ for Arti.
+  local container=$1 unit=$2 address=$3 port=$4 minutes=$5
+  local tries=$(( minutes * 30 )) n
+  for (( n = 0; n < tries; n++ )); do
+    if podman exec "$container" bash -c "exec 3<>/dev/tcp/$address/$port" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "$unit is not accepting connections on $address:$port after $minutes minutes." >&2
+  echo "Its own log says why: journalctl -u $unit -n 50" >&2
   return 1
 }
 
@@ -175,6 +219,22 @@ install_quadlets() {
   install_template "$BUNDLE_DIR/quadlet/monero-wallet-rpc.container" \
     "$QUADLET_DIR/monero-wallet-rpc.container"
   systemctl daemon-reload
+  # daemon-reload succeeds even when the Quadlet generator rejected a file: the
+  # unit is simply never created, and the first sign was a restart failing with
+  # "Unit arti.service not found", which says nothing about the cause.  Ask for
+  # each unit, and show the generator's own complaint if one is missing.
+  local unit missing=()
+  for unit in "${SERVICES[@]}" monero-wallet-rpc.service crypto-network.service crypto-egress-network.service; do
+    [[ $(systemctl show -p LoadState --value "$unit" 2>/dev/null) == loaded ]] || missing+=("$unit")
+  done
+  if (( ${#missing[@]} )); then
+    printf 'The Quadlet generator did not produce: %s\n' "${missing[*]}" >&2
+    if [[ -x /usr/libexec/podman/quadlet ]]; then
+      echo 'Its own report on the installed files:' >&2
+      /usr/libexec/podman/quadlet -dryrun 2>&1 >/dev/null | sed 's/^/  /' >&2 || true
+    fi
+    return 1
+  fi
 }
 
 install_update_timer() {
@@ -205,9 +265,9 @@ migrate_internal_network() {
   cat <<MIGRATE
 
 The existing 'crypto' network is not internal (internal=$internal, dns=$dns).
-Bitcoin and Monero on it can still reach the clearnet, so the network-level
-part of their Tor-only guarantee is not actually in force.  Recreating it --
-the daemons stop for a moment and come back on the same volumes and addresses.
+The daemons on it can still reach the clearnet, so the network-level part of
+their Tor-only guarantee is not actually in force.  Recreating it -- the
+daemons stop for a moment and come back on the same volumes and addresses.
 MIGRATE
   systemctl stop monero-wallet-rpc.service "${SERVICES[@]}"
   # RemainAfterExit keeps the network unit "active" long after podman ran, and
@@ -218,7 +278,7 @@ MIGRATE
 Could not remove the 'crypto' network.  Something is still attached to it.
 Find it with `podman ps -a --filter network=crypto`, detach or remove it, then
 rerun.  Refusing to continue: carrying on here would leave the deployment
-looking hardened while Bitcoin and Monero still had a route out.
+looking hardened while the daemons still had a route out.
 STUCK
     return 1
   fi
@@ -236,7 +296,10 @@ restart_chain_services() {
 
 write_images_env() {
   # A record of exactly what is deployed, so --check and an operator reading
-  # the host can both see the resolved pins without re-deriving them.
+  # the host can both see the resolved pins without re-deriving them.  Written
+  # once the units point at these images, never before the build: a build that
+  # failed used to leave this naming images that were never deployed, which
+  # update.sh then took for the truth.
   {
     printf 'BITCOIN_IMAGE=%s\n' "$BITCOIN_IMAGE"
     printf 'LITECOIN_IMAGE=%s\n' "$LITECOIN_IMAGE"
@@ -247,23 +310,87 @@ write_images_env() {
   } >"$PREFIX/images.env"
 }
 
-prune_old_images() {
-  # Every version bump leaves the previous tag behind, on the same filesystem as
-  # the wallets.  Only this bundle's own superseded tags are removed, and never
-  # fatally: an image still in use by a running container refuses to go, which
-  # is the correct outcome.  Dangling layers left by the multi-stage builds are
-  # deliberately not swept -- `podman image prune` is not scoped to this bundle,
-  # and this host may not be dedicated to it.  See the README.
-  local ref repo
-  for ref in "$ARTI_IMAGE" "$BITCOIN_IMAGE" "$LITECOIN_IMAGE" "$MONERO_IMAGE"; do
-    repo=${ref%:*}
-    podman images --format '{{.Repository}}:{{.Tag}}' "$repo" 2>/dev/null |
-      grep -vxF "$ref" | xargs -r podman rmi >/dev/null 2>&1 || true
+deployed_value() {
+  # One NAME=value line out of images.env, the record of what the installed
+  # units point at.  Empty when there is no record yet.
+  [[ -r $PREFIX/images.env ]] || return 0
+  sed -n "s/^$1=//p" "$PREFIX/images.env" | tail -n 1
+}
+
+# Image IDs this bundle had tagged before a build, filled by
+# remember_bundle_images and consumed by remove_superseded_images.
+PREVIOUS_IMAGE_IDS=()
+
+remember_bundle_images() {
+  # Taken before building, so that afterwards exactly the images the build
+  # replaced can be named by ID.  A version bump leaves the old tag behind; a
+  # base-image refresh rebuilds under the SAME tag and leaves the old image
+  # untagged -- the old cleanup, which went by tag, never saw that second case,
+  # so every `--apply base` stranded four images on the host for good.
+  # Each entry is "ID NAME", the name kept for the report: after a same-tag
+  # rebuild the old image has no tag left to be called by.
+  local repo
+  PREVIOUS_IMAGE_IDS=()
+  for repo in "${IMAGE_REPOS[@]}"; do
+    mapfile -t -O "${#PREVIOUS_IMAGE_IDS[@]}" PREVIOUS_IMAGE_IDS < <(
+      podman images --no-trunc --format '{{.ID}} {{.Repository}}:{{.Tag}}' "$repo" 2>/dev/null)
   done
+}
+
+remove_superseded_images() {
+  # Removes, by exact ID and without force, each image remember_bundle_images
+  # saw that no current tag points at any more.  Nothing outside this bundle's
+  # own repositories is ever a candidate, so there is no prune here: `podman
+  # image prune` acts on the whole host, which may not be dedicated to this.
+  # An image a container still uses is refused by podman and kept, and said so.
+  # Intermediate layers of arti's Rust build stage are not reachable from any of
+  # these IDs and stay as build cache; see the README.
+  local ref entry id name current reason removed=0
+  local -A keep=() seen=()
+  for ref in "$ARTI_IMAGE" "$BITCOIN_IMAGE" "$LITECOIN_IMAGE" "$MONERO_IMAGE"; do
+    current=$(podman image inspect --format '{{.Id}}' "$ref" 2>/dev/null) || continue
+    keep[${current#sha256:}]=1
+  done
+  for entry in "${PREVIOUS_IMAGE_IDS[@]}"; do
+    id=${entry%% *}
+    name=${entry#* }
+    id=${id#sha256:}
+    [[ -n $id && -z ${keep[$id]:-} && -z ${seen[$id]:-} ]] || continue
+    seen[$id]=1
+    podman image exists "$id" 2>/dev/null || continue
+    if reason=$(podman rmi "$id" 2>&1 >/dev/null); then
+      removed=$((removed + 1))
+    else
+      reason=${reason##*$'\n'}
+      printf 'Kept the earlier %s (%s): %s\n' "$name" "${id:0:12}" "${reason#Error: }"
+    fi
+  done
+  if (( removed == 1 )); then
+    echo 'Removed 1 image this build replaced.'
+  elif (( removed > 1 )); then
+    printf 'Removed %d images this build replaced.\n' "$removed"
+  fi
 }
 
 restart_all_services() {
   # monero-wallet-rpc is excluded from restart_chain_services because at install
   # time it cannot start until the wallet exists; by update time it always does.
   systemctl restart "${SERVICES[@]}" monero-wallet-rpc.service
+}
+
+wait_for_services() {
+  # Arguments are component names: arti, bitcoin, litecoin, monero.  monero
+  # covers the wallet RPC too, since both run the same image.
+  local comp
+  for comp in "$@"; do
+    case $comp in
+      arti)     wait_for_listener crypto-arti arti 10.89.0.10 9150 5 ;;
+      bitcoin)  wait_for_core_rpc bitcoin bitcoin-cli ;;
+      litecoin) wait_for_core_rpc litecoin litecoin-cli ;;
+      monero)
+        wait_for_listener monero monero 127.0.0.1 18089 10
+        wait_for_listener monero-wallet-rpc monero-wallet-rpc 127.0.0.1 18088 5
+        ;;
+    esac
+  done
 }

@@ -35,7 +35,12 @@ DropCapability=all
 # address only, so nothing is listening on loopback.  Keep these three copies of
 # the address -- Network= above, socks_listen in arti.toml, and this line -- in
 # step with each other.
-HealthCmd=bash -c "exec 3<>/dev/tcp/10.89.0.10/9150"
+# Single quotes, never double: Quadlet (5.4 on Debian 13) drops a double quote
+# that ends a value, so `bash -c "exec ..."` reached podman with its closing
+# quote missing, /bin/sh rejected it as an unterminated string, and this check
+# reported a healthy Arti as unhealthy forever.  Checked with the generator's
+# -dryrun; see the README's note on health checks.
+HealthCmd=bash -c 'exec 3<>/dev/tcp/10.89.0.10/9150'
 HealthInterval=1m
 HealthStartPeriod=5m
 HealthTimeout=20s

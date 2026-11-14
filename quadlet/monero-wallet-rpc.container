@@ -30,8 +30,9 @@ NoNewPrivileges=true
 ReadOnly=true
 Tmpfs=/tmp
 DropCapability=all
-# Report-only liveness; see the notes in arti.container and monero.container.
-HealthCmd=bash -c "exec 3<>/dev/tcp/127.0.0.1/18088"
+# Report-only liveness; see the notes in arti.container and monero.container,
+# including why the command is single-quoted.
+HealthCmd=bash -c 'exec 3<>/dev/tcp/127.0.0.1/18088'
 HealthInterval=1m
 HealthStartPeriod=5m
 HealthTimeout=30s
